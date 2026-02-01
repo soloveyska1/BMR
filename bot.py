@@ -9,6 +9,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
     FSInputFile,
 )
 from aiogram.filters import Command, CommandObject
@@ -75,6 +78,19 @@ QUICK_REPLIES = {
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def get_admin_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Постоянные кнопки внизу экрана для админов"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🆕 Непрочитанные")],
+            [KeyboardButton(text="⭐ Избранные"), KeyboardButton(text="🔍 Поиск")],
+            [KeyboardButton(text="📦 Экспорт"), KeyboardButton(text="🏷 Категории")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True
+    )
 
 
 def get_admin_menu_keyboard(stats: dict) -> InlineKeyboardMarkup:
@@ -265,7 +281,8 @@ async def cmd_start(message: Message, state: FSMContext):
             f"📅 Сегодня: <b>{stats['today']}</b>\n"
         )
 
-        await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_admin_menu_keyboard(stats))
+        # Показываем кнопки внизу экрана + inline меню
+        await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_admin_reply_keyboard())
     else:
         await message.answer(
             "👋 <b>Привет!</b>\n\n"
@@ -277,8 +294,154 @@ async def cmd_start(message: Message, state: FSMContext):
             "• Видео\n"
             "• Документ\n\n"
             "✨ <i>Каждое сообщение важно!</i>",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            reply_markup=ReplyKeyboardRemove()
         )
+
+
+# ============ ОБРАБОТЧИКИ КНОПОК АДМИНА ============
+
+@dp.message(F.text == "📊 Статистика")
+async def btn_stats(message: Message):
+    """Кнопка статистики"""
+    if not is_admin(message.from_user.id):
+        return
+
+    stats = await get_stats()
+
+    top_text = ""
+    for i, (name, username, count) in enumerate(stats["top_users"], 1):
+        medal = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"][i-1] if i <= 5 else f"{i}."
+        user_display = f"@{username}" if username else name
+        top_text += f"{medal} {user_display}: {count}\n"
+
+    cat_text = ""
+    for cat, count in stats["categories"].items():
+        cat_text += f"• {CATEGORIES.get(cat, cat)}: {count}\n"
+    if not cat_text:
+        cat_text = "• <i>нет данных</i>\n"
+
+    text = (
+        f"📊 <b>СТАТИСТИКА</b>\n\n"
+        f"<b>📨 Сообщения:</b>\n"
+        f"• Всего: {stats['total']}\n"
+        f"• Сегодня: {stats['today']}\n"
+        f"• За неделю: {stats['week']}\n"
+        f"• 🆕 Непрочитанных: {stats['unread']}\n"
+        f"• ⭐ Избранных: {stats['starred']}\n"
+        f"• ↩️ С ответами: {stats['replied']}\n\n"
+        f"<b>👥 Пользователи:</b> {stats['unique_users']}\n\n"
+        f"<b>🏆 Топ активных:</b>\n{top_text}\n"
+        f"<b>🏷 По категориям:</b>\n{cat_text}"
+    )
+
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+@dp.message(F.text == "🆕 Непрочитанные")
+async def btn_unread(message: Message, state: FSMContext):
+    """Кнопка непрочитанных"""
+    if not is_admin(message.from_user.id):
+        return
+
+    messages = await get_unread_messages(limit=50)
+
+    if not messages:
+        await message.answer("✅ Всё прочитано!")
+        return
+
+    await state.update_data(message_list=[dict(m) for m in messages], list_type="unread")
+
+    msg = messages[0]
+    text = format_message_card(msg)
+    keyboard = get_nav_keyboard(0, len(messages), "unread", msg["id"])
+
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
+@dp.message(F.text == "⭐ Избранные")
+async def btn_starred(message: Message, state: FSMContext):
+    """Кнопка избранных"""
+    if not is_admin(message.from_user.id):
+        return
+
+    messages = await get_starred_messages(limit=50)
+
+    if not messages:
+        await message.answer("⭐ Избранных нет")
+        return
+
+    await state.update_data(message_list=[dict(m) for m in messages], list_type="starred")
+
+    msg = messages[0]
+    text = format_message_card(msg)
+    keyboard = get_nav_keyboard(0, len(messages), "starred", msg["id"])
+
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
+@dp.message(F.text == "🔍 Поиск")
+async def btn_search(message: Message, state: FSMContext):
+    """Кнопка поиска"""
+    if not is_admin(message.from_user.id):
+        return
+
+    await state.set_state(ReplyState.waiting_for_search)
+    await message.answer("🔍 <b>Поиск</b>\n\nНапиши текст для поиска:", parse_mode=ParseMode.HTML)
+
+
+@dp.message(F.text == "📦 Экспорт")
+async def btn_export(message: Message):
+    """Кнопка экспорта"""
+    if not is_admin(message.from_user.id):
+        return
+
+    await message.answer("📦 Готовлю экспорт...")
+
+    messages = await export_messages()
+
+    if not messages:
+        await message.answer("📭 Нет сообщений")
+        return
+
+    export_data = []
+    for msg in messages:
+        export_data.append({
+            "id": msg["id"],
+            "user_id": msg["user_id"],
+            "username": msg["username"],
+            "full_name": msg["full_name"],
+            "text": msg["text"],
+            "is_starred": bool(msg["is_starred"]),
+            "category": msg["category"],
+            "created_at": msg["created_at"],
+            "reply_text": msg["reply_text"],
+        })
+
+    filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(export_data, f, ensure_ascii=False, indent=2)
+
+    await message.answer_document(
+        FSInputFile(filename),
+        caption=f"📦 Экспорт: {len(export_data)} сообщений"
+    )
+
+    import os
+    os.remove(filename)
+
+
+@dp.message(F.text == "🏷 Категории")
+async def btn_categories(message: Message):
+    """Кнопка категорий"""
+    if not is_admin(message.from_user.id):
+        return
+
+    await message.answer(
+        "🏷 <b>Категории</b>\n\nВыбери категорию:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_categories_keyboard()
+    )
 
 
 @dp.message(Command("cancel"))
