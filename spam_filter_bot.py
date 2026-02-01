@@ -418,6 +418,32 @@ async def cmd_help(message: Message):
     )
 
 
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    """Приветствие в личных сообщениях"""
+    if message.chat.type != "private":
+        return
+
+    is_admin = message.from_user.id in ADMIN_IDS
+
+    await message.answer(
+        "🛡 <b>Спам-фильтр бот</b>\n\n"
+        "Я защищаю чаты от спама и ботов.\n\n"
+        "<b>Что я умею:</b>\n"
+        "• Верификация новых участников кнопкой\n"
+        "• Фильтрация спама по 100+ ключевым словам\n"
+        "• Обнаружение обхода фильтров (латиница вместо кириллицы)\n"
+        "• Блокировка ссылок и упоминаний\n\n"
+        "<b>Как подключить:</b>\n"
+        "1. Добавьте меня в группу\n"
+        "2. Назначьте администратором\n"
+        "3. Дайте права: удалять сообщения, банить\n\n"
+        + ("👑 <b>Вы администратор бота</b>\n"
+           "Команды: /spam_stats, /spam_add, /spam_help" if is_admin else ""),
+        parse_mode="HTML"
+    )
+
+
 async def main():
     """Запуск бота"""
     logger.info("Starting spam filter bot...")
