@@ -1,7 +1,12 @@
 import asyncio
 import logging
 import json
+import os
 from datetime import datetime
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -166,6 +171,209 @@ async def notify_admins_new_message(msg_id: int, user_name: str, text_preview: s
             )
         except Exception as e:
             logger.warning(f"Не удалось уведомить админа {admin_id}: {e}")
+
+
+async def create_excel_export(messages: list, stats: dict) -> str:
+    """Создать красивый Excel файл с экспортом"""
+    wb = Workbook()
+
+    # ============ ЛИСТ 1: ВСЕ СООБЩЕНИЯ ============
+    ws = wb.active
+    ws.title = "Сообщения"
+
+    # Стили
+    header_font = Font(bold=True, color="FFFFFF", size=12)
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    starred_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    unread_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    replied_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
+
+    thin_border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+
+    # Заголовки
+    headers = [
+        "№", "Дата", "Время", "Имя", "Username", "User ID",
+        "Сообщение", "Категория", "Приоритет", "Статус",
+        "Избранное", "Ответ", "Дата ответа"
+    ]
+
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_alignment
+        cell.border = thin_border
+
+    # Данные
+    for row_idx, msg in enumerate(messages, 2):
+        # Парсим дату
+        if isinstance(msg["created_at"], str):
+            dt = datetime.fromisoformat(msg["created_at"])
+        else:
+            dt = msg["created_at"]
+
+        # Определяем приоритет
+        priority = detect_priority(msg["text"]) if msg["text"] else "normal"
+        priority_text = {"high": "🔴 Срочно", "medium": "🟡 Средний", "normal": "🟢 Обычный"}.get(priority, "")
+
+        # Категория
+        category_text = CATEGORIES.get(msg["category"], "") if msg["category"] else ""
+
+        # Статус
+        status_parts = []
+        if not msg["is_read"]:
+            status_parts.append("Новое")
+        if msg["reply_text"]:
+            status_parts.append("Отвечено")
+        status_text = ", ".join(status_parts) if status_parts else "Прочитано"
+
+        # Дата ответа
+        replied_at = ""
+        if msg.get("replied_at"):
+            if isinstance(msg["replied_at"], str):
+                replied_at = datetime.fromisoformat(msg["replied_at"]).strftime("%d.%m.%Y %H:%M")
+            else:
+                replied_at = msg["replied_at"].strftime("%d.%m.%Y %H:%M")
+
+        row_data = [
+            msg["id"],
+            dt.strftime("%d.%m.%Y"),
+            dt.strftime("%H:%M"),
+            msg["full_name"],
+            f"@{msg['username']}" if msg["username"] else "",
+            msg["user_id"],
+            msg["text"] or "[медиа]",
+            category_text,
+            priority_text,
+            status_text,
+            "⭐ Да" if msg["is_starred"] else "",
+            msg["reply_text"] or "",
+            replied_at
+        ]
+
+        for col, value in enumerate(row_data, 1):
+            cell = ws.cell(row=row_idx, column=col, value=value)
+            cell.border = thin_border
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+            # Подсветка строк
+            if msg["is_starred"]:
+                cell.fill = starred_fill
+            elif not msg["is_read"]:
+                cell.fill = unread_fill
+            elif msg["reply_text"]:
+                cell.fill = replied_fill
+
+    # Ширина колонок
+    column_widths = [6, 12, 8, 20, 18, 12, 50, 18, 15, 15, 10, 40, 18]
+    for col, width in enumerate(column_widths, 1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    # Закрепить заголовок
+    ws.freeze_panes = "A2"
+
+    # ============ ЛИСТ 2: СТАТИСТИКА ============
+    ws_stats = wb.create_sheet("Статистика")
+
+    stat_header_fill = PatternFill(start_color="70AD47", end_color="70AD47", fill_type="solid")
+
+    stats_data = [
+        ("📊 ОБЩАЯ СТАТИСТИКА БИМ РАДИО", ""),
+        ("", ""),
+        ("Всего сообщений", stats.get("total", 0)),
+        ("Сегодня", stats.get("today", 0)),
+        ("За неделю", stats.get("week", 0)),
+        ("", ""),
+        ("🆕 Непрочитанных", stats.get("unread", 0)),
+        ("⭐ Избранных", stats.get("starred", 0)),
+        ("↩️ С ответами", stats.get("replied", 0)),
+        ("", ""),
+        ("👥 Уникальных пользователей", stats.get("unique_users", 0)),
+        ("", ""),
+        ("📅 Дата экспорта", datetime.now().strftime("%d.%m.%Y %H:%M")),
+    ]
+
+    for row_idx, (label, value) in enumerate(stats_data, 1):
+        cell_label = ws_stats.cell(row=row_idx, column=1, value=label)
+        cell_value = ws_stats.cell(row=row_idx, column=2, value=value)
+
+        if row_idx == 1:
+            cell_label.font = Font(bold=True, size=14, color="FFFFFF")
+            cell_label.fill = stat_header_fill
+            cell_value.fill = stat_header_fill
+        else:
+            cell_label.font = Font(bold=True) if label else Font()
+
+    ws_stats.column_dimensions["A"].width = 30
+    ws_stats.column_dimensions["B"].width = 20
+
+    # ============ ЛИСТ 3: ТОП ПОЛЬЗОВАТЕЛЕЙ ============
+    ws_top = wb.create_sheet("Топ пользователей")
+
+    top_headers = ["Место", "Имя", "Username", "Сообщений"]
+    for col, header in enumerate(top_headers, 1):
+        cell = ws_top.cell(row=1, column=col, value=header)
+        cell.font = header_font
+        cell.fill = PatternFill(start_color="ED7D31", end_color="ED7D31", fill_type="solid")
+        cell.alignment = header_alignment
+        cell.border = thin_border
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    for row_idx, (name, username, count) in enumerate(stats.get("top_users", []), 2):
+        medal = medals[row_idx - 2] if row_idx - 2 < len(medals) else str(row_idx - 1)
+        ws_top.cell(row=row_idx, column=1, value=medal).border = thin_border
+        ws_top.cell(row=row_idx, column=2, value=name).border = thin_border
+        ws_top.cell(row=row_idx, column=3, value=f"@{username}" if username else "").border = thin_border
+        ws_top.cell(row=row_idx, column=4, value=count).border = thin_border
+
+    ws_top.column_dimensions["A"].width = 8
+    ws_top.column_dimensions["B"].width = 25
+    ws_top.column_dimensions["C"].width = 20
+    ws_top.column_dimensions["D"].width = 12
+
+    # ============ ЛИСТ 4: ПО КАТЕГОРИЯМ ============
+    ws_cat = wb.create_sheet("По категориям")
+
+    cat_headers = ["Категория", "Количество"]
+    for col, header in enumerate(cat_headers, 1):
+        cell = ws_cat.cell(row=1, column=col, value=header)
+        cell.font = header_font
+        cell.fill = PatternFill(start_color="7030A0", end_color="7030A0", fill_type="solid")
+        cell.alignment = header_alignment
+        cell.border = thin_border
+
+    row_idx = 2
+    for cat_key, count in stats.get("categories", {}).items():
+        cat_name = CATEGORIES.get(cat_key, cat_key)
+        ws_cat.cell(row=row_idx, column=1, value=cat_name).border = thin_border
+        ws_cat.cell(row=row_idx, column=2, value=count).border = thin_border
+        row_idx += 1
+
+    ws_cat.column_dimensions["A"].width = 25
+    ws_cat.column_dimensions["B"].width = 15
+
+    # Сохраняем файл
+    filename = f"bim_radio_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    wb.save(filename)
+
+    return filename
+
+
+def get_export_format_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура выбора формата экспорта"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Excel (красивый отчёт)", callback_data="export:excel")],
+        [InlineKeyboardButton(text="📄 JSON (для разработчиков)", callback_data="export:json")],
+        [InlineKeyboardButton(text="📊 Excel + 📄 JSON (оба)", callback_data="export:both")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")],
+    ])
 
 
 def get_admin_reply_keyboard() -> ReplyKeyboardMarkup:
@@ -489,43 +697,19 @@ async def btn_search(message: Message, state: FSMContext):
 
 @dp.message(F.text == "📦 Экспорт")
 async def btn_export(message: Message):
-    """Кнопка экспорта"""
+    """Кнопка экспорта - показать выбор формата"""
     if not is_admin(message.from_user.id):
         return
 
-    await message.answer("📦 Готовлю экспорт...")
-
-    messages = await export_messages()
-
-    if not messages:
-        await message.answer("📭 Нет сообщений")
-        return
-
-    export_data = []
-    for msg in messages:
-        export_data.append({
-            "id": msg["id"],
-            "user_id": msg["user_id"],
-            "username": msg["username"],
-            "full_name": msg["full_name"],
-            "text": msg["text"],
-            "is_starred": bool(msg["is_starred"]),
-            "category": msg["category"],
-            "created_at": msg["created_at"],
-            "reply_text": msg["reply_text"],
-        })
-
-    filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(export_data, f, ensure_ascii=False, indent=2)
-
-    await message.answer_document(
-        FSInputFile(filename),
-        caption=f"📦 Экспорт: {len(export_data)} сообщений"
+    stats = await get_stats()
+    await message.answer(
+        f"📦 <b>Экспорт данных БИМ радио</b>\n\n"
+        f"📨 Сообщений для экспорта: <b>{stats['total']}</b>\n"
+        f"👥 Пользователей: <b>{stats['unique_users']}</b>\n\n"
+        f"Выбери формат:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_export_format_keyboard()
     )
-
-    import os
-    os.remove(filename)
 
 
 @dp.message(F.text == "🏷 Категории")
@@ -695,44 +879,114 @@ async def callback_menu_search(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "menu:export")
 async def callback_menu_export(callback: CallbackQuery):
-    """Экспорт"""
+    """Показать меню выбора формата экспорта"""
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔️")
         return
 
+    stats = await get_stats()
+    await callback.message.edit_text(
+        f"📦 <b>Экспорт данных БИМ радио</b>\n\n"
+        f"📨 Сообщений для экспорта: <b>{stats['total']}</b>\n"
+        f"👥 Пользователей: <b>{stats['unique_users']}</b>\n\n"
+        f"Выбери формат:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_export_format_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("export:"))
+async def callback_export_format(callback: CallbackQuery):
+    """Экспорт в выбранном формате"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️")
+        return
+
+    format_type = callback.data.split(":")[1]
     await callback.answer("📦 Готовлю экспорт...")
 
     messages = await export_messages()
+    stats = await get_stats()
 
     if not messages:
-        await callback.message.answer("📭 Нет сообщений")
+        await callback.message.edit_text("📭 Нет сообщений для экспорта")
         return
 
-    export_data = []
-    for msg in messages:
-        export_data.append({
-            "id": msg["id"],
-            "user_id": msg["user_id"],
-            "username": msg["username"],
-            "full_name": msg["full_name"],
-            "text": msg["text"],
-            "is_starred": bool(msg["is_starred"]),
-            "category": msg["category"],
-            "created_at": msg["created_at"],
-            "reply_text": msg["reply_text"],
-        })
+    files_to_send = []
+    files_to_delete = []
 
-    filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(export_data, f, ensure_ascii=False, indent=2)
+    # Excel
+    if format_type in ("excel", "both"):
+        excel_filename = await create_excel_export([dict(m) for m in messages], stats)
+        files_to_send.append((excel_filename, f"📊 Excel: {len(messages)} сообщений, 4 листа"))
+        files_to_delete.append(excel_filename)
 
-    await callback.message.answer_document(
-        FSInputFile(filename),
-        caption=f"📦 Экспорт: {len(export_data)} сообщений"
+    # JSON
+    if format_type in ("json", "both"):
+        export_data = []
+        for msg in messages:
+            export_data.append({
+                "id": msg["id"],
+                "user_id": msg["user_id"],
+                "username": msg["username"],
+                "full_name": msg["full_name"],
+                "text": msg["text"],
+                "has_photo": bool(msg["has_photo"]),
+                "has_voice": bool(msg["has_voice"]),
+                "has_video": bool(msg["has_video"]),
+                "is_starred": bool(msg["is_starred"]),
+                "is_read": bool(msg["is_read"]),
+                "is_hidden": bool(msg["is_hidden"]),
+                "category": msg["category"],
+                "priority": detect_priority(msg["text"]) if msg["text"] else "normal",
+                "created_at": msg["created_at"],
+                "reply_text": msg["reply_text"],
+                "replied_at": msg.get("replied_at"),
+            })
+
+        json_filename = f"bim_radio_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(json_filename, "w", encoding="utf-8") as f:
+            json.dump({
+                "export_date": datetime.now().isoformat(),
+                "total_messages": len(export_data),
+                "stats": {
+                    "total": stats["total"],
+                    "unread": stats["unread"],
+                    "starred": stats["starred"],
+                    "replied": stats["replied"],
+                    "unique_users": stats["unique_users"],
+                },
+                "messages": export_data
+            }, f, ensure_ascii=False, indent=2)
+
+        files_to_send.append((json_filename, f"📄 JSON: {len(messages)} сообщений"))
+        files_to_delete.append(json_filename)
+
+    # Отправляем файлы
+    for filename, caption in files_to_send:
+        await callback.message.answer_document(
+            FSInputFile(filename),
+            caption=caption
+        )
+
+    # Удаляем временные файлы
+    for filename in files_to_delete:
+        os.remove(filename)
+
+    # Обновляем сообщение
+    format_name = {"excel": "Excel", "json": "JSON", "both": "Excel + JSON"}[format_type]
+    await callback.message.edit_text(
+        f"✅ <b>Экспорт завершён!</b>\n\n"
+        f"📦 Формат: {format_name}\n"
+        f"📨 Сообщений: {len(messages)}\n"
+        f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Ещё экспорт", callback_data="menu:export")],
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="menu:back")],
+        ])
     )
-
-    import os
-    os.remove(filename)
 
 
 @dp.callback_query(F.data == "menu:categories")
