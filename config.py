@@ -5,7 +5,10 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+# Поддержка нескольких админов
+_admin_ids_str = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(x.strip()) for x in _admin_ids_str.split(",") if x.strip()]
 
 # Путь к базе данных
 DATABASE_PATH = "messages.db"

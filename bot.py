@@ -12,7 +12,12 @@ from aiogram.types import (
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 
-from config import BOT_TOKEN, CHANNEL_ID, ADMIN_ID, AUTO_REPLY_TEXT
+from config import BOT_TOKEN, CHANNEL_ID, ADMIN_IDS, AUTO_REPLY_TEXT
+
+
+def is_admin(user_id: int) -> bool:
+    """Проверить, является ли пользователь админом"""
+    return user_id in ADMIN_IDS
 from database import (
     init_db,
     save_message,
@@ -76,7 +81,7 @@ def format_message_header(user_id: int, username: str, full_name: str, created_a
 async def cmd_start(message: Message):
     """Обработчик команды /start"""
     # Если это админ
-    if message.from_user.id == ADMIN_ID:
+    if is_admin(message.from_user.id):
         await message.answer(
             "👋 Привет, админ!\n\n"
             "Доступные команды:\n"
@@ -95,7 +100,7 @@ async def cmd_start(message: Message):
 @dp.message(Command("starred"))
 async def cmd_starred(message: Message):
     """Показать избранные сообщения"""
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
 
     messages = await get_starred_messages(limit=20)
@@ -123,7 +128,7 @@ async def cmd_starred(message: Message):
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
     """Показать статистику"""
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
 
     stats = await get_stats()
@@ -142,8 +147,8 @@ async def cmd_stats(message: Message):
 @dp.message(F.text | F.photo | F.voice | F.video | F.video_note | F.document)
 async def handle_user_message(message: Message):
     """Обработка входящих сообщений от пользователей"""
-    # Игнорируем сообщения от админа (кроме команд)
-    if message.from_user.id == ADMIN_ID:
+    # Игнорируем сообщения от админов (кроме команд)
+    if is_admin(message.from_user.id):
         return
 
     user = message.from_user
@@ -307,7 +312,7 @@ async def main():
 
     logger.info("Бот запущен!")
     logger.info(f"Канал для пересылки: {CHANNEL_ID}")
-    logger.info(f"Админ: {ADMIN_ID}")
+    logger.info(f"Админы: {ADMIN_IDS}")
 
     # Запускаем поллинг
     await dp.start_polling(bot)
