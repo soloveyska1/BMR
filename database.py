@@ -289,3 +289,51 @@ async def get_message_by_channel_id(channel_message_id: int):
             (channel_message_id,)
         )
         return await cursor.fetchone()
+
+
+async def get_user_history(user_id: int, limit: int = 5):
+    """Получить историю сообщений пользователя"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT * FROM messages
+            WHERE user_id = ? AND is_hidden = 0
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit)
+        )
+        return await cursor.fetchall()
+
+
+async def get_user_stats(user_id: int):
+    """Получить статистику пользователя"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        # Всего сообщений
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM messages WHERE user_id = ? AND is_hidden = 0",
+            (user_id,)
+        )
+        total = (await cursor.fetchone())[0]
+
+        # Первое сообщение
+        cursor = await db.execute(
+            "SELECT created_at FROM messages WHERE user_id = ? ORDER BY created_at ASC LIMIT 1",
+            (user_id,)
+        )
+        first_row = await cursor.fetchone()
+        first_message = first_row[0] if first_row else None
+
+        # Получено ответов
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM messages WHERE user_id = ? AND reply_text IS NOT NULL AND is_hidden = 0",
+            (user_id,)
+        )
+        replied = (await cursor.fetchone())[0]
+
+        return {
+            "total": total,
+            "first_message": first_message,
+            "replied": replied
+        }

@@ -35,6 +35,8 @@ from database import (
     search_messages,
     get_stats,
     export_messages,
+    get_user_history,
+    get_user_stats,
 )
 
 # Логирование
@@ -64,13 +66,28 @@ CATEGORIES = {
     "problem": "⚠️ Проблема",
 }
 
-# Шаблоны быстрых ответов
+# Шаблоны быстрых ответов для БИМ радио
 QUICK_REPLIES = {
-    "thanks": "🙏 Спасибо за ваше сообщение! Очень ценим обратную связь.",
-    "idea_good": "💡 Отличная идея! Обязательно рассмотрим.",
-    "will_answer": "⏳ Спасибо за вопрос! Ответим в ближайшее время.",
-    "noted": "✅ Принято! Учтём в работе.",
-    "thanks_review": "❤️ Благодарим за тёплый отзыв! Это очень мотивирует.",
+    "thanks": "🎵 Спасибо за новость, люБИМка! Ты лучший(ая)!",
+    "touched": "❤️ Ого, тронуло до глубины души! Спасибо, что поделился, люБИМка!",
+    "on_air": "🎤 Обязательно передадим в эфир! Оставайся на волне БИМ!",
+    "idea_good": "💡 Крутая идея, люБИМка! Возьмём на заметку!",
+    "hug": "🤗 Обнимаем тебя через радиоволны! Спасибо, что ты с нами!",
+}
+
+# Ключевые слова для автокатегоризации
+AUTO_CATEGORIES = {
+    "question": ["как ", "почему", "зачем", "когда ", "где ", "кто ", "что ", "?", "подскажите", "помогите"],
+    "idea": ["предлагаю", "идея", "можно было бы", "хорошо бы", "а если", "давайте"],
+    "thanks": ["спасибо", "благодар", "молодцы", "класс", "круто", "супер", "лучшие", "люблю вас"],
+    "problem": ["проблема", "не работает", "ошибка", "плохо", "ужас", "жалоба", "недовол"],
+    "review": ["слушаю", "нравится", "эфир", "передача", "песня", "музыка", "ведущ"],
+}
+
+# Ключевые слова для приоритетов
+PRIORITY_KEYWORDS = {
+    "high": ["срочно", "важно", "помогите", "sos", "пожалуйста срочно", "критично", "немедленно"],
+    "medium": ["вопрос", "когда", "подскажите", "ждём", "ожидаем"],
 }
 
 
@@ -78,6 +95,77 @@ QUICK_REPLIES = {
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def detect_category(text: str) -> str | None:
+    """Автоматически определить категорию по ключевым словам"""
+    if not text:
+        return None
+    text_lower = text.lower()
+    for category, keywords in AUTO_CATEGORIES.items():
+        for keyword in keywords:
+            if keyword in text_lower:
+                return category
+    return None
+
+
+def detect_priority(text: str) -> str:
+    """Определить приоритет сообщения"""
+    if not text:
+        return "normal"
+    text_lower = text.lower()
+    for priority, keywords in PRIORITY_KEYWORDS.items():
+        for keyword in keywords:
+            if keyword in text_lower:
+                return priority
+    return "normal"
+
+
+def get_priority_emoji(priority: str) -> str:
+    """Эмодзи приоритета"""
+    return {"high": "🔴", "medium": "🟡", "normal": "🟢"}.get(priority, "🟢")
+
+
+def format_wait_time(created_at) -> str:
+    """Форматировать время ожидания ответа"""
+    if isinstance(created_at, str):
+        dt = datetime.fromisoformat(created_at)
+    else:
+        dt = created_at
+
+    delta = datetime.now() - dt
+    minutes = int(delta.total_seconds() / 60)
+    hours = minutes // 60
+    days = hours // 24
+
+    if days > 0:
+        return f"⏳ {days}д {hours % 24}ч"
+    elif hours > 0:
+        return f"⏳ {hours}ч {minutes % 60}мин"
+    else:
+        return f"⏳ {minutes}мин"
+
+
+async def notify_admins_new_message(msg_id: int, user_name: str, text_preview: str, priority: str):
+    """Push-уведомление админам о новом сообщении"""
+    priority_emoji = get_priority_emoji(priority)
+    preview = text_preview[:50] + "..." if len(text_preview) > 50 else text_preview
+
+    notification = (
+        f"{priority_emoji} <b>Новое сообщение #{msg_id}</b>\n"
+        f"👤 {user_name}\n"
+        f"💬 {preview or '[медиа]'}"
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=notification,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить админа {admin_id}: {e}")
 
 
 def get_admin_reply_keyboard() -> ReplyKeyboardMarkup:
@@ -152,13 +240,13 @@ def get_message_keyboard(message_db_id: int, is_starred: bool = False, show_nav:
 
 
 def get_quick_reply_keyboard(message_db_id: int) -> InlineKeyboardMarkup:
-    """Клавиатура быстрых ответов"""
+    """Клавиатура быстрых ответов для БИМ радио"""
     buttons = [
-        [InlineKeyboardButton(text="🙏 Спасибо за сообщение!", callback_data=f"qr:{message_db_id}:thanks")],
-        [InlineKeyboardButton(text="💡 Отличная идея!", callback_data=f"qr:{message_db_id}:idea_good")],
-        [InlineKeyboardButton(text="⏳ Ответим скоро", callback_data=f"qr:{message_db_id}:will_answer")],
-        [InlineKeyboardButton(text="✅ Принято!", callback_data=f"qr:{message_db_id}:noted")],
-        [InlineKeyboardButton(text="❤️ Спасибо за отзыв!", callback_data=f"qr:{message_db_id}:thanks_review")],
+        [InlineKeyboardButton(text="🎵 Спасибо, люБИМка!", callback_data=f"qr:{message_db_id}:thanks")],
+        [InlineKeyboardButton(text="❤️ Тронуло до глубины!", callback_data=f"qr:{message_db_id}:touched")],
+        [InlineKeyboardButton(text="🎤 Передадим в эфир!", callback_data=f"qr:{message_db_id}:on_air")],
+        [InlineKeyboardButton(text="💡 Крутая идея!", callback_data=f"qr:{message_db_id}:idea_good")],
+        [InlineKeyboardButton(text="🤗 Обнимаем через радиоволны!", callback_data=f"qr:{message_db_id}:hug")],
         [InlineKeyboardButton(text="✏️ Свой текст...", callback_data=f"customreply:{message_db_id}")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancelreply")],
     ]
@@ -238,6 +326,10 @@ def format_message_card(msg, show_text: bool = True) -> str:
     if msg["category"]:
         status += CATEGORIES.get(msg["category"], "").split()[0] + " "
 
+    # Приоритет
+    priority = detect_priority(msg["text"]) if msg["text"] else "normal"
+    priority_emoji = get_priority_emoji(priority)
+
     username = f"@{msg['username']}" if msg['username'] else msg['full_name']
 
     if isinstance(msg["created_at"], str):
@@ -246,9 +338,14 @@ def format_message_card(msg, show_text: bool = True) -> str:
         dt = msg["created_at"]
     date_str = dt.strftime("%d.%m.%Y %H:%M")
 
-    text = f"<b>#{msg['id']}</b> {status}\n"
+    # Время ожидания (если нет ответа)
+    wait_time = ""
+    if not msg["reply_text"]:
+        wait_time = " " + format_wait_time(msg["created_at"])
+
+    text = f"{priority_emoji} <b>#{msg['id']}</b> {status}\n"
     text += f"👤 {username} ({msg['full_name']})\n"
-    text += f"🕐 {date_str}\n"
+    text += f"🕐 {date_str}{wait_time}\n"
 
     if show_text:
         content = msg["text"] or "[медиа]"
@@ -865,7 +962,7 @@ async def callback_category(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("reply:"))
 async def callback_reply(callback: CallbackQuery, state: FSMContext):
-    """Начать ответ - показать быстрые ответы"""
+    """Начать ответ - показать быстрые ответы и историю пользователя"""
     msg_id = int(callback.data.split(":")[1])
     msg = await get_message_by_id(msg_id)
 
@@ -875,9 +972,29 @@ async def callback_reply(callback: CallbackQuery, state: FSMContext):
 
     await state.update_data(reply_to_msg_id=msg_id, reply_to_user_id=msg["user_id"])
 
+    # Получаем историю пользователя
+    user_stats = await get_user_stats(msg["user_id"])
+    user_history = await get_user_history(msg["user_id"], limit=3)
+
+    # Формируем историю
+    history_text = ""
+    if user_stats["total"] > 1:
+        history_text = f"\n\n📊 <b>История люБИМки:</b>\n"
+        history_text += f"• Всего сообщений: {user_stats['total']}\n"
+        history_text += f"• Ответов получено: {user_stats['replied']}\n"
+
+        if len(user_history) > 1:
+            history_text += "\n<i>Последние сообщения:</i>\n"
+            for h in user_history[1:]:  # Пропускаем текущее
+                preview = (h["text"] or "[медиа]")[:40]
+                if len(h["text"] or "") > 40:
+                    preview += "..."
+                history_text += f"• {preview}\n"
+
     await callback.message.answer(
         f"💬 <b>Ответ на #{msg_id}</b>\n"
-        f"От: {msg['full_name']}\n\n"
+        f"От: {msg['full_name']}"
+        f"{history_text}\n\n"
         f"Выбери быстрый ответ или напиши свой:",
         parse_mode=ParseMode.HTML,
         reply_markup=get_quick_reply_keyboard(msg_id)
@@ -1022,6 +1139,11 @@ async def handle_user_message(message: Message, state: FSMContext):
     has_video = bool(message.video or message.video_note)
     text_content = message.text or message.caption or ""
 
+    # Автоопределение категории и приоритета
+    auto_category = detect_category(text_content)
+    priority = detect_priority(text_content)
+    priority_emoji = get_priority_emoji(priority)
+
     try:
         # Сохраняем
         msg_id = await save_message(
@@ -1036,6 +1158,19 @@ async def handle_user_message(message: Message, state: FSMContext):
             has_video=has_video
         )
 
+        # Устанавливаем автокатегорию если определена
+        if auto_category:
+            await set_category(msg_id, auto_category)
+
+        # Добавляем приоритет в заголовок
+        priority_line = ""
+        if priority != "normal":
+            priority_line = f"\n{priority_emoji} <b>{'СРОЧНО!' if priority == 'high' else 'Требует внимания'}</b>"
+
+        category_line = ""
+        if auto_category:
+            category_line = f"\n🏷 {CATEGORIES.get(auto_category, auto_category)}"
+
         header = format_message_header(
             msg_id=msg_id,
             user_id=user.id,
@@ -1043,6 +1178,7 @@ async def handle_user_message(message: Message, state: FSMContext):
             full_name=full_name,
             created_at=datetime.now()
         )
+        header = header.rstrip() + priority_line + category_line + "\n\n"
 
         keyboard = get_message_keyboard(msg_id)
 
@@ -1090,8 +1226,11 @@ async def handle_user_message(message: Message, state: FSMContext):
                 reply_markup=keyboard
             )
 
+        # Push-уведомления админам
+        await notify_admins_new_message(msg_id, full_name, text_content, priority)
+
         await message.answer(AUTO_REPLY_TEXT)
-        logger.info(f"#{msg_id} от {full_name}")
+        logger.info(f"#{msg_id} от {full_name} [{priority}]")
 
     except Exception as e:
         logger.error(f"Ошибка: {e}")
