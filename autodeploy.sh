@@ -16,8 +16,8 @@ log() {
 # Создаем директорию если нет
 mkdir -p "$BOT_DIR"
 
-# Получаем текущий хеш файла на GitHub
-REMOTE_HASH=$(curl -sL "$REPO_URL/$BOT_FILE" | md5sum | cut -d' ' -f1)
+# Получаем текущий хеш файла на GitHub (с cache-busting)
+REMOTE_HASH=$(curl -sL "$REPO_URL/$BOT_FILE?$(date +%s)" | md5sum | cut -d' ' -f1)
 
 if [ -z "$REMOTE_HASH" ]; then
     log "ERROR: Не удалось получить файл с GitHub"
@@ -35,8 +35,8 @@ fi
 if [ "$REMOTE_HASH" != "$LOCAL_HASH" ]; then
     log "Обнаружено обновление! Деплою..."
 
-    # Скачиваем новую версию
-    curl -sL -o "$BOT_DIR/$BOT_FILE.new" "$REPO_URL/$BOT_FILE"
+    # Скачиваем новую версию (с cache-busting)
+    curl -sL -o "$BOT_DIR/$BOT_FILE.new" "$REPO_URL/$BOT_FILE?$(date +%s)"
 
     if [ $? -eq 0 ] && [ -s "$BOT_DIR/$BOT_FILE.new" ]; then
         # Бэкапим старую версию
