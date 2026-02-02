@@ -25,6 +25,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from config import BOT_TOKEN, CHANNEL_ID, ADMIN_IDS, AUTO_REPLY_TEXT
+
+# Версия бота и время запуска
+VERSION = "3.3"
+BOT_START_TIME = datetime.now()
 from database import (
     init_db,
     save_message,
@@ -129,6 +133,21 @@ def detect_priority(text: str) -> str:
 def get_priority_emoji(priority: str) -> str:
     """Эмодзи приоритета"""
     return {"high": "🔴", "medium": "🟡", "normal": "🟢"}.get(priority, "🟢")
+
+
+def format_uptime() -> str:
+    """Форматировать время работы бота"""
+    delta = datetime.now() - BOT_START_TIME
+    days = delta.days
+    hours, remainder = divmod(delta.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if days > 0:
+        return f"{days}д {hours}ч {minutes}мин"
+    elif hours > 0:
+        return f"{hours}ч {minutes}мин"
+    else:
+        return f"{minutes}мин {seconds}сек"
 
 
 def format_wait_time(created_at) -> str:
@@ -983,12 +1002,13 @@ async def cmd_start(message: Message, state: FSMContext):
         stats = await get_stats()
 
         text = (
-            f"👋 <b>Панель управления</b>\n\n"
+            f"👋 <b>Панель управления</b> <code>v{VERSION}</code>\n\n"
             f"📨 Всего сообщений: <b>{stats['total']}</b>\n"
             f"🆕 Непрочитанных: <b>{stats['unread']}</b>\n"
             f"⭐ Избранных: <b>{stats['starred']}</b>\n"
             f"👥 Пользователей: <b>{stats['unique_users']}</b>\n"
             f"📅 Сегодня: <b>{stats['today']}</b>\n"
+            f"⏱ Uptime: <b>{format_uptime()}</b>\n"
         )
 
         # Показываем кнопки внизу экрана + inline меню
@@ -1137,6 +1157,24 @@ async def cmd_cancel(message: Message, state: FSMContext):
     await message.answer("❌ Отменено")
 
 
+@dp.message(Command("ping"))
+async def cmd_ping(message: Message):
+    """Проверка здоровья бота"""
+    if not is_admin(message.from_user.id):
+        return
+
+    stats = await get_stats()
+    text = (
+        f"🏓 <b>Pong!</b>\n\n"
+        f"📻 БИМ Радио бот <code>v{VERSION}</code>\n"
+        f"⏱ Uptime: <b>{format_uptime()}</b>\n"
+        f"📨 Сообщений: <b>{stats['total']}</b>\n"
+        f"🆕 Непрочитанных: <b>{stats['unread']}</b>\n"
+        f"✅ Бот работает нормально!"
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
 # ============ CALLBACK: МЕНЮ ============
 
 @dp.callback_query(F.data == "menu:back")
@@ -1152,12 +1190,13 @@ async def callback_menu_back(callback: CallbackQuery, state: FSMContext):
     stats = await get_stats()
 
     text = (
-        f"👋 <b>Панель управления</b>\n\n"
+        f"👋 <b>Панель управления</b> <code>v{VERSION}</code>\n\n"
         f"📨 Всего сообщений: <b>{stats['total']}</b>\n"
         f"🆕 Непрочитанных: <b>{stats['unread']}</b>\n"
         f"⭐ Избранных: <b>{stats['starred']}</b>\n"
         f"👥 Пользователей: <b>{stats['unique_users']}</b>\n"
         f"📅 Сегодня: <b>{stats['today']}</b>\n"
+        f"⏱ Uptime: <b>{format_uptime()}</b>\n"
     )
 
     try:
@@ -1901,9 +1940,10 @@ async def handle_user_message(message: Message, state: FSMContext):
 async def main():
     await init_db()
     logger.info("=" * 40)
-    logger.info("🚀 Бот запущен!")
+    logger.info(f"🚀 БИМ Радио бот v{VERSION} запущен!")
     logger.info(f"📢 Канал: {CHANNEL_ID}")
     logger.info(f"👑 Админы: {ADMIN_IDS}")
+    logger.info(f"🕐 Запуск: {BOT_START_TIME.strftime('%d.%m.%Y %H:%M:%S')}")
     logger.info("=" * 40)
     await dp.start_polling(bot)
 
