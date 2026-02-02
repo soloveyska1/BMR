@@ -58,6 +58,9 @@ load_dotenv()
 BOT_TOKEN = os.getenv("SPAM_BOT_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("SPAM_ADMIN_IDS", "").split(",") if x.strip()]
 
+# Тестеры - видят всё как обычные пользователи, но никогда не блокируются
+TESTER_IDS = [8420766371]
+
 # Время на верификацию (секунды)
 VERIFY_TIMEOUT = 60
 
@@ -990,6 +993,24 @@ async def process_spam_message(message: Message, reason: str, confidence: float)
     """Обработать спам-сообщение"""
     user_id = message.from_user.id
     chat_id = message.chat.id
+    user_name = message.from_user.full_name or message.from_user.username
+
+    # Тестер - показываем что сработало, но НЕ удаляем и НЕ баним
+    if user_id in TESTER_IDS:
+        test_msg = await message.reply(
+            f"🧪 <b>ТЕСТ-РЕЖИМ</b>\n\n"
+            f"Обнаружен спам: <i>{reason}</i>\n"
+            f"Уверенность: {confidence:.0%}\n\n"
+            f"<i>Сообщение НЕ удалено (вы тестер)</i>",
+            parse_mode="HTML"
+        )
+        await asyncio.sleep(10)
+        try:
+            await test_msg.delete()
+        except:
+            pass
+        logger.info(f"[TESTER] Spam detected from {user_name} ({user_id}): {reason} [{confidence:.0%}]")
+        return
 
     try:
         # Удаляем сообщение
@@ -1000,7 +1021,6 @@ async def process_spam_message(message: Message, reason: str, confidence: float)
         # Добавляем предупреждение
         warnings = storage.add_warning(user_id)
 
-        user_name = message.from_user.full_name or message.from_user.username
         logger.info(f"Spam deleted from {user_name} ({user_id}): {reason} [{confidence:.0%}], warning {warnings}/{MAX_WARNINGS}")
 
         # Проверяем на авто-бан
@@ -1039,6 +1059,9 @@ async def on_user_join(event: ChatMemberUpdated):
     if user.id in ADMIN_IDS:
         verified_users.add(user.id)
         return
+
+    # Тестеры - показываем верификацию, но НЕ ограничиваем
+    is_tester = user.id in TESTER_IDS
 
     if user.id in verified_users:
         return
@@ -1109,37 +1132,45 @@ async def on_user_join(event: ChatMemberUpdated):
     profile.join_time = datetime.now()
 
     try:
-        # Ограничиваем права
-        await bot.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=user.id,
-            permissions=ChatPermissions(
-                can_send_messages=False,
-                can_send_media_messages=False,
-                can_send_other_messages=False,
-                can_add_web_page_previews=False
+        # Ограничиваем права (кроме тестеров)
+        if not is_tester:
+            await bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user.id,
+                permissions=ChatPermissions(
+                    can_send_messages=False,
+                    can_send_media_messages=False,
+                    can_send_other_messages=False,
+                    can_add_web_page_previews=False
+                )
             )
-        )
 
         user_name = user.full_name or user.username or "друг"
+        tester_note = "\n\n🧪 <i>(Тестовый режим - вы НЕ ограничены)</i>" if is_tester else ""
         msg = await bot.send_message(
             chat_id=chat_id,
             text=(
                 f"🎙 <b>Привет, {user_name}!</b>\n\n"
                 f"{CHAT_RULES}\n"
                 f"⏰ Нажми кнопку ниже в течение {VERIFY_TIMEOUT} секунд, "
-                f"чтобы присоединиться к нашей музыкальной семье!"
+                f"чтобы присоединиться к нашей музыкальной семье!{tester_note}"
             ),
             reply_markup=get_verify_keyboard(user.id),
             parse_mode="HTML"
         )
 
-        task = asyncio.create_task(kick_unverified(user.id, chat_id, msg.message_id))
+        # Тестеров не кикаем по таймауту
+        if not is_tester:
+            task = asyncio.create_task(kick_unverified(user.id, chat_id, msg.message_id))
+        else:
+            task = None
+            logger.info(f"[TESTER] User {user.id} is tester, will not be kicked")
 
         pending_verification[user.id] = {
             "chat_id": chat_id,
             "message_id": msg.message_id,
-            "task": task
+            "task": task,
+            "is_tester": is_tester
         }
 
         logger.info(f"User {user.id} ({user_name}) joined, waiting for verification")
@@ -1160,25 +1191,31 @@ async def on_verify_click(callback: CallbackQuery):
     chat_id = callback.message.chat.id
 
     try:
+        is_tester = user_id in TESTER_IDS
+
         if user_id in pending_verification:
-            pending_verification[user_id]["task"].cancel()
+            task = pending_verification[user_id].get("task")
+            if task:  # Для тестеров task может быть None
+                task.cancel()
             pending_verification.pop(user_id, None)
 
         # Для новичков - ограниченные права (нельзя ссылки/форварды)
-        await bot.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
-            permissions=ChatPermissions(
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=False,  # Нельзя превью ссылок
-                can_send_polls=True,
-                can_invite_users=False,  # Нельзя приглашать
-                can_change_info=False,
-                can_pin_messages=False
+        # Тестерам не ограничиваем
+        if not is_tester:
+            await bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                permissions=ChatPermissions(
+                    can_send_messages=True,
+                    can_send_media_messages=True,
+                    can_send_other_messages=True,
+                    can_add_web_page_previews=False,  # Нельзя превью ссылок
+                    can_send_polls=True,
+                    can_invite_users=False,  # Нельзя приглашать
+                    can_change_info=False,
+                    can_pin_messages=False
+                )
             )
-        )
 
         verified_users.add(user_id)
         stats["users_verified"] += 1
@@ -1310,6 +1347,7 @@ async def check_text_for_spam(message: Message, text: str):
     """Проверить текст на спам"""
     user_id = message.from_user.id
     chat_id = message.chat.id
+    is_tester = user_id in TESTER_IDS
 
     # Записываем активность
     behavior_analyzer.record_message(user_id)
@@ -1319,8 +1357,8 @@ async def check_text_for_spam(message: Message, text: str):
     is_night = is_night_mode()
     text_has_links = has_links(text)
 
-    # Проверка cooldown для новичков
-    if is_newbie:
+    # Проверка cooldown для новичков (тестеры видят предупреждение, но не блокируются)
+    if is_newbie and not is_tester:
         can_send, seconds_left = behavior_analyzer.check_newbie_cooldown(user_id)
         if not can_send:
             try:
@@ -1335,20 +1373,45 @@ async def check_text_for_spam(message: Message, text: str):
                 pass
             return
         behavior_analyzer.record_newbie_message(user_id)
+    elif is_newbie and is_tester:
+        # Тестер-новичок - показываем что сработало бы
+        can_send, seconds_left = behavior_analyzer.check_newbie_cooldown(user_id)
+        if not can_send:
+            warn_msg = await message.reply(
+                f"🧪 <b>ТЕСТ:</b> Slow mode ({seconds_left} сек.) — сообщение НЕ удалено",
+                parse_mode="HTML"
+            )
+            await asyncio.sleep(5)
+            try:
+                await warn_msg.delete()
+            except:
+                pass
+        behavior_analyzer.record_newbie_message(user_id)
 
     # Ограничение ссылок для новичков
     if is_newbie and text_has_links:
-        try:
-            await message.delete()
-            stats["newbie_restricted"] += 1
-            warn_msg = await message.answer(
-                f"🔗 Новые участники не могут отправлять ссылки первые {NEWBIE_HOURS} часов.",
+        if is_tester:
+            warn_msg = await message.reply(
+                f"🧪 <b>ТЕСТ:</b> Ссылки для новичков запрещены — сообщение НЕ удалено",
+                parse_mode="HTML"
             )
             await asyncio.sleep(5)
-            await warn_msg.delete()
-        except:
-            pass
-        return
+            try:
+                await warn_msg.delete()
+            except:
+                pass
+        else:
+            try:
+                await message.delete()
+                stats["newbie_restricted"] += 1
+                warn_msg = await message.answer(
+                    f"🔗 Новые участники не могут отправлять ссылки первые {NEWBIE_HOURS} часов.",
+                )
+                await asyncio.sleep(5)
+                await warn_msg.delete()
+            except:
+                pass
+            return
 
     # Проверка на мат
     if check_profanity(text):
