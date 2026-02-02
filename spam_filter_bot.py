@@ -1,5 +1,5 @@
 """
-Спам-фильтр бот для Telegram чатов v3.0
+Спам-фильтр бот для Telegram чатов v3.1
 ========================================
 Фичи:
 - ✅ Верификация с правилами чата
@@ -60,6 +60,10 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("SPAM_ADMIN_IDS", "").split(",") 
 
 # Тестеры - видят всё как обычные пользователи, но никогда не блокируются
 TESTER_IDS = [8420766371]
+
+# Версия и время деплоя (обновляется автоматически)
+BOT_VERSION = "3.1"
+DEPLOY_TIME = "2026-02-02 04:45 MSK"
 
 # Время на верификацию (секунды)
 VERIFY_TIMEOUT = 60
@@ -1469,7 +1473,8 @@ async def cmd_stats(message: Message):
     lockdown_status = "🔴 АКТИВЕН" if raid_detector.is_lockdown() else "🟢 неактивен"
 
     await message.answer(
-        f"🎙 <b>БИМ радио — Статистика v3.0</b>\n\n"
+        f"🎙 <b>БИМ радио — Статистика v{BOT_VERSION}</b>\n\n"
+        f"📦 Деплой: {DEPLOY_TIME}\n"
         f"⏱ Аптайм: {hours}ч {minutes}м\n"
         f"🌙 Ночной режим: {night_status}\n"
         f"🚨 Lockdown: {lockdown_status}\n\n"
