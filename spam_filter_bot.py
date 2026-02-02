@@ -88,6 +88,11 @@ DATA_DIR.mkdir(exist_ok=True)
 WHITELIST_FILE = DATA_DIR / "whitelist.json"
 WARNINGS_FILE = DATA_DIR / "warnings.json"
 
+# Версия бота
+VERSION_FILE = Path(__file__).parent / "VERSION"
+BOT_VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "3.0"
+START_TIME = datetime.now()
+
 # ============== ПРАВИЛА ЧАТА ==============
 CHAT_RULES = """
 🎙 <b>Добро пожаловать в чат БИМ радио 102.8 FM!</b>
@@ -1812,9 +1817,26 @@ async def grant_full_permissions_task():
             logger.error(f"Permissions task error: {e}")
 
 
+async def notify_admins_on_start():
+    """Уведомление админов о запуске/перезапуске бота"""
+    night_status = "включён" if NIGHT_MODE_ENABLED else "выключен"
+    message = (
+        f"🛡 <b>Spam Filter Bot запущен!</b>\n\n"
+        f"📦 Версия: <code>{BOT_VERSION}</code>\n"
+        f"🕐 Время: {START_TIME.strftime('%d.%m.%Y %H:%M:%S')}\n"
+        f"🌙 Ночной режим: {night_status}\n"
+        f"⚠️ Макс. предупреждений: {MAX_WARNINGS}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, message, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить админа {admin_id}: {e}")
+
+
 async def main():
     """Запуск бота"""
-    logger.info("Starting spam filter bot v3.0...")
+    logger.info(f"Starting spam filter bot v{BOT_VERSION}...")
     logger.info(f"OCR available: {OCR_AVAILABLE}")
     logger.info(f"Aiohttp available: {AIOHTTP_AVAILABLE}")
     logger.info(f"Night mode: {NIGHT_START} - {NIGHT_END}")
@@ -1828,6 +1850,9 @@ async def main():
     asyncio.create_task(grant_full_permissions_task())
 
     await bot.delete_webhook(drop_pending_updates=True)
+
+    # Уведомить админов о запуске
+    await notify_admins_on_start()
 
     logger.info("Bot started successfully!")
     await dp.start_polling(bot)

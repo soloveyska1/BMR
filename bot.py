@@ -3,6 +3,7 @@ import logging
 import json
 import os
 from datetime import datetime
+from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -47,6 +48,11 @@ from database import (
 # Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Версия бота
+VERSION_FILE = Path(__file__).parent / "VERSION"
+BOT_VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "unknown"
+START_TIME = datetime.now()
 
 # Инициализация бота
 bot = Bot(token=BOT_TOKEN)
@@ -1898,13 +1904,32 @@ async def handle_user_message(message: Message, state: FSMContext):
 
 # ============ ЗАПУСК ============
 
+async def notify_admins_on_start():
+    """Уведомление админов о запуске/перезапуске бота"""
+    message = (
+        f"🚀 <b>Message Collector Bot запущен!</b>\n\n"
+        f"📦 Версия: <code>{BOT_VERSION}</code>\n"
+        f"🕐 Время: {START_TIME.strftime('%d.%m.%Y %H:%M:%S')}\n"
+        f"📢 Канал: <code>{CHANNEL_ID}</code>"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, message, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить админа {admin_id}: {e}")
+
+
 async def main():
     await init_db()
     logger.info("=" * 40)
-    logger.info("🚀 Бот запущен!")
+    logger.info(f"🚀 Бот запущен! Версия: {BOT_VERSION}")
     logger.info(f"📢 Канал: {CHANNEL_ID}")
     logger.info(f"👑 Админы: {ADMIN_IDS}")
     logger.info("=" * 40)
+
+    # Уведомить админов о запуске
+    await notify_admins_on_start()
+
     await dp.start_polling(bot)
 
 
