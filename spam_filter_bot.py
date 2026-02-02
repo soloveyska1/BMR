@@ -62,8 +62,8 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("SPAM_ADMIN_IDS", "").split(",") 
 TESTER_IDS = [8420766371]
 
 # Версия и время деплоя (обновляется автоматически)
-BOT_VERSION = "3.2"
-DEPLOY_TIME = "2026-02-02 05:02 MSK"
+BOT_VERSION = "3.3"
+DEPLOY_TIME = "2026-02-02 05:15 MSK"
 
 # Время на верификацию (секунды)
 VERIFY_TIMEOUT = 60
@@ -1560,6 +1560,89 @@ async def cmd_whitelist(message: Message):
         )
 
 
+@router.message(Command("spam_check"))
+async def cmd_check_user(message: Message):
+    """Полная проверка пользователя — все данные в одном месте"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    # Получаем user_id из реплая или аргумента
+    target_user_id = None
+    target_name = "Неизвестно"
+
+    if message.reply_to_message:
+        target_user_id = message.reply_to_message.from_user.id
+        target_name = message.reply_to_message.from_user.full_name
+    else:
+        args = message.text.split()
+        if len(args) >= 2:
+            try:
+                target_user_id = int(args[1])
+            except ValueError:
+                await message.answer("❌ Неверный ID. Используйте: /spam_check <user_id> или реплай на сообщение")
+                return
+        else:
+            await message.answer(
+                "🔍 <b>Проверка пользователя</b>\n\n"
+                "Использование:\n"
+                "• /spam_check <user_id>\n"
+                "• Реплай на сообщение + /spam_check",
+                parse_mode="HTML"
+            )
+            return
+
+    # Собираем всю информацию
+    warnings = storage.get_warnings(target_user_id)
+    is_banned = storage.is_banned(target_user_id)
+    is_whitelisted = storage.is_whitelisted(target_user_id)
+    is_verified = target_user_id in verified_users
+    is_admin = target_user_id in ADMIN_IDS
+    is_tester = target_user_id in TESTER_IDS
+
+    profile = behavior_analyzer.get_profile(target_user_id)
+    is_newbie = behavior_analyzer.is_newbie(target_user_id)
+
+    # Время в чате
+    hours_in_chat = (datetime.now() - profile.join_time).total_seconds() / 3600
+
+    # CAS проверка
+    is_cas = await cas_checker.check(target_user_id)
+
+    # Формируем статусы
+    statuses = []
+    if is_admin:
+        statuses.append("👑 Админ")
+    if is_tester:
+        statuses.append("🧪 Тестер")
+    if is_whitelisted:
+        statuses.append("✅ Whitelist")
+    if is_banned:
+        statuses.append("⛔️ Забанен")
+    if is_cas:
+        statuses.append("🛡 CAS-бан")
+    if is_verified:
+        statuses.append("✓ Верифицирован")
+    if is_newbie:
+        statuses.append("🆕 Новичок")
+
+    status_line = " | ".join(statuses) if statuses else "Обычный пользователь"
+
+    report = (
+        f"🔍 <b>Проверка пользователя</b>\n\n"
+        f"👤 ID: <code>{target_user_id}</code>\n"
+        f"📛 Имя: {target_name}\n\n"
+        f"<b>Статус:</b> {status_line}\n\n"
+        f"<b>Данные:</b>\n"
+        f"⚠️ Предупреждений: {warnings}/{MAX_WARNINGS}\n"
+        f"📊 Спам-скор: {profile.spam_score:.2f}\n"
+        f"💬 Сообщений: {profile.message_count}\n"
+        f"🗑 Удалено: {profile.messages_deleted}\n"
+        f"⏱ В чате: {hours_in_chat:.1f}ч\n"
+    )
+
+    await message.answer(report, parse_mode="HTML")
+
+
 @router.message(Command("spam_unban"))
 async def cmd_unban(message: Message):
     """Разбанить пользователя"""
@@ -1709,11 +1792,12 @@ async def cmd_help(message: Message):
         return
 
     await message.answer(
-        "🎙 <b>БИМ радио — Команды антиспам бота v3.0</b>\n\n"
+        f"🎙 <b>БИМ радио — Команды антиспам бота v{BOT_VERSION}</b>\n\n"
         "<b>📊 Статистика:</b>\n"
         "/spam_stats — статистика бота\n\n"
-        "<b>🔍 Тестирование:</b>\n"
-        "/spam_test <текст> — проверить текст на спам\n\n"
+        "<b>🔍 Проверка:</b>\n"
+        "/spam_test <текст> — проверить текст на спам\n"
+        "/spam_check <id> — полная проверка юзера\n\n"
         "<b>📝 Управление:</b>\n"
         "/spam_add <слово> — добавить стоп-слово\n"
         "/spam_whitelist — управление whitelist\n"
@@ -1724,11 +1808,11 @@ async def cmd_help(message: Message):
         "<b>🛡 Возможности:</b>\n"
         "• Верификация с правилами БИМ радио\n"
         "• CAS (Combot Anti-Spam)\n"
+        "• Детекция 18+ спама и переманок\n"
         "• Авто-бан после 5 предупреждений\n"
         "• Ночной режим (23:00-07:00)\n"
         "• Антирейд защита\n"
         "• ML классификатор спама\n"
-        "• OCR для картинок\n"
         "• Мат-фильтр",
         parse_mode="HTML"
     )
