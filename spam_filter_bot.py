@@ -87,15 +87,18 @@ WARNINGS_FILE = DATA_DIR / "warnings.json"
 
 # ============== ПРАВИЛА ЧАТА ==============
 CHAT_RULES = """
-📋 <b>Правила чата:</b>
+🎙 <b>Добро пожаловать в чат БИМ радио 102.8 FM!</b>
 
-1️⃣ <b>Не рекламируем</b> — никаких услуг, товаров, каналов
-2️⃣ <b>Не спамим</b> — без повторных сообщений и флуда
-3️⃣ <b>Не материмся</b> — общаемся культурно
-4️⃣ <b>Уважаем друг друга</b> — без оскорблений и хейта
-5️⃣ <b>По теме</b> — обсуждаем то, что интересно всем
+Мы рады каждому слушателю! Чтобы всем было комфортно:
 
-⚠️ Нарушители будут удалены!
+📋 <b>Правила:</b>
+1️⃣ <b>Без рекламы</b> — никаких услуг, товаров, каналов
+2️⃣ <b>Без спама</b> — не флудим и не повторяемся
+3️⃣ <b>Культурно общаемся</b> — без мата и оскорблений
+4️⃣ <b>Уважаем друг друга</b> — мы одна музыкальная семья!
+5️⃣ <b>По теме</b> — музыка, радио, Казань и хорошее настроение 🎵
+
+⚠️ За нарушения — предупреждение, потом бан.
 """
 
 # ============== СТОП-СЛОВА ==============
@@ -652,6 +655,46 @@ class OCRProcessor:
             return ""
 
 
+class RaidDetector:
+    """Детектор рейдов и массовых атак"""
+
+    def __init__(self):
+        self.lockdown_active = False
+        self.join_times: Dict[int, List[datetime]] = defaultdict(list)
+        self.raid_threshold = 10  # Юзеров за минуту
+        self.auto_lockdown_triggered = False
+
+    def record_join(self, chat_id: int) -> bool:
+        """Записать вход и проверить на рейд. Возвращает True если рейд"""
+        now = datetime.now()
+        self.join_times[chat_id].append(now)
+
+        # Оставляем только последнюю минуту
+        cutoff = now - timedelta(minutes=1)
+        self.join_times[chat_id] = [t for t in self.join_times[chat_id] if t > cutoff]
+
+        joins_per_minute = len(self.join_times[chat_id])
+
+        # Автоматический lockdown при рейде
+        if joins_per_minute >= self.raid_threshold and not self.auto_lockdown_triggered:
+            self.lockdown_active = True
+            self.auto_lockdown_triggered = True
+            logger.warning(f"RAID DETECTED in {chat_id}! {joins_per_minute} joins/min. Auto-lockdown activated!")
+            return True
+
+        return False
+
+    def is_lockdown(self) -> bool:
+        return self.lockdown_active
+
+    def get_join_rate(self, chat_id: int) -> int:
+        """Получить количество входов за последнюю минуту"""
+        now = datetime.now()
+        cutoff = now - timedelta(minutes=1)
+        self.join_times[chat_id] = [t for t in self.join_times[chat_id] if t > cutoff]
+        return len(self.join_times[chat_id])
+
+
 # ============== ИНИЦИАЛИЗАЦИЯ ==============
 
 bot = Bot(token=BOT_TOKEN)
@@ -669,6 +712,7 @@ similarity_checker = MessageSimilarityChecker()
 behavior_analyzer = UserBehaviorAnalyzer()
 ml_classifier = MLSpamClassifier()
 ocr_processor = OCRProcessor()
+raid_detector = RaidDetector()
 
 # Статистика
 stats = {
@@ -683,6 +727,7 @@ stats = {
     "night_mode_blocked": 0,
     "newbie_restricted": 0,
     "ocr_detections": 0,
+    "raids_detected": 0,
     "start_time": datetime.now()
 }
 
@@ -781,7 +826,7 @@ def get_verify_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Клавиатура для верификации"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text="✅ Я прочитал(а) правила и не робот",
+            text="🎵 Я слушаю БИМ радио и принимаю правила!",
             callback_data=f"verify_{user_id}"
         )]
     ])
@@ -878,6 +923,30 @@ async def on_user_join(event: ChatMemberUpdated):
             pass
         return
 
+    # Антирейд проверка
+    is_raid = raid_detector.record_join(chat_id)
+    if is_raid:
+        stats["raids_detected"] += 1
+        await notify_admins(
+            f"🚨 <b>РЕЙД ОБНАРУЖЕН!</b>\n\n"
+            f"Чат: <code>{chat_id}</code>\n"
+            f"Входов/мин: {raid_detector.get_join_rate(chat_id)}\n\n"
+            f"Автоматическая блокировка ВКЛЮЧЕНА!\n"
+            f"Отключить: /spam_lockdown off"
+        )
+
+    # Если lockdown активен — кикаем сразу
+    if raid_detector.is_lockdown():
+        try:
+            await bot.ban_chat_member(chat_id=chat_id, user_id=user.id)
+            await asyncio.sleep(1)
+            await bot.unban_chat_member(chat_id=chat_id, user_id=user.id)
+            stats["users_kicked"] += 1
+            logger.info(f"Lockdown: kicked user {user.id}")
+        except:
+            pass
+        return
+
     # CAS проверка
     is_cas_banned = await cas_checker.check(user.id)
     if is_cas_banned:
@@ -917,15 +986,14 @@ async def on_user_join(event: ChatMemberUpdated):
             )
         )
 
-        user_name = user.full_name or user.username or "Пользователь"
+        user_name = user.full_name or user.username or "друг"
         msg = await bot.send_message(
             chat_id=chat_id,
             text=(
-                f"👋 <b>Добро пожаловать, {user_name}!</b>\n\n"
+                f"🎙 <b>Привет, {user_name}!</b>\n\n"
                 f"{CHAT_RULES}\n"
-                f"🔒 Для подтверждения нажмите кнопку ниже "
-                f"в течение {VERIFY_TIMEOUT} секунд.\n\n"
-                f"Иначе вы будете удалены из чата."
+                f"⏰ Нажми кнопку ниже в течение {VERIFY_TIMEOUT} секунд, "
+                f"чтобы присоединиться к нашей музыкальной семье!"
             ),
             reply_markup=get_verify_keyboard(user.id),
             parse_mode="HTML"
@@ -981,9 +1049,9 @@ async def on_verify_click(callback: CallbackQuery):
         stats["users_verified"] += 1
 
         await callback.message.edit_text(
-            f"✅ <b>{callback.from_user.full_name}</b> верифицирован!\n\n"
-            f"📋 Не забывайте о правилах чата.\n"
-            f"Добро пожаловать! 🎉",
+            f"🎉 <b>{callback.from_user.full_name}</b> теперь с нами!\n\n"
+            f"🎵 Добро пожаловать в семью БИМ радио!\n"
+            f"Слушай 102.8 FM и общайся с нами 📻",
             parse_mode="HTML"
         )
 
@@ -1200,11 +1268,13 @@ async def cmd_stats(message: Message):
     minutes = int((uptime.total_seconds() % 3600) // 60)
 
     night_status = "🌙 АКТИВЕН" if is_night_mode() else "☀️ неактивен"
+    lockdown_status = "🔴 АКТИВЕН" if raid_detector.is_lockdown() else "🟢 неактивен"
 
     await message.answer(
-        f"📊 <b>Статистика спам-фильтра v3.0</b>\n\n"
+        f"🎙 <b>БИМ радио — Статистика v3.0</b>\n\n"
         f"⏱ Аптайм: {hours}ч {minutes}м\n"
-        f"🌙 Ночной режим: {night_status}\n\n"
+        f"🌙 Ночной режим: {night_status}\n"
+        f"🚨 Lockdown: {lockdown_status}\n\n"
         f"<b>Блокировки:</b>\n"
         f"🗑 Удалено спама: {stats['spam_deleted']}\n"
         f"🔄 Дубликатов: {stats['duplicates_blocked']}\n"
@@ -1212,6 +1282,7 @@ async def cmd_stats(message: Message):
         f"🤬 За мат: {stats['profanity_blocked']}\n"
         f"🆕 Новички: {stats['newbie_restricted']}\n"
         f"📷 OCR: {stats['ocr_detections']}\n"
+        f"🚨 Рейдов: {stats['raids_detected']}\n"
         f"👤 Подозрительных: {stats['suspicious_users_blocked']}\n\n"
         f"<b>Пользователи:</b>\n"
         f"✅ Верифицировано: {stats['users_verified']}\n"
@@ -1337,6 +1408,97 @@ async def cmd_check_warnings(message: Message):
         await message.answer("❌ Неверный ID пользователя")
 
 
+@router.message(Command("spam_test"))
+async def cmd_test_spam(message: Message):
+    """Проверить текст на спам"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: /spam_test <текст для проверки>")
+        return
+
+    test_text = args[1]
+
+    # Создаём фейковый профиль для теста
+    fake_profile = UserProfile(user_id=0)
+
+    # Извлекаем признаки
+    features = ml_classifier.extract_features(
+        test_text, fake_profile,
+        is_newbie=True, is_night=is_night_mode(),
+        has_link=has_links(test_text), is_cas_banned=False
+    )
+
+    is_spam_result, confidence, triggered = ml_classifier.classify(features)
+
+    # Проверка на мат
+    has_profanity = check_profanity(test_text)
+
+    # Формируем отчёт
+    result = "🚫 <b>СПАМ</b>" if is_spam_result else "✅ <b>Чисто</b>"
+
+    report = (
+        f"🔍 <b>Результат проверки:</b>\n\n"
+        f"📝 Текст: <code>{test_text[:100]}{'...' if len(test_text) > 100 else ''}</code>\n\n"
+        f"{result} (уверенность: {confidence:.0%})\n\n"
+    )
+
+    if triggered:
+        report += f"⚠️ Сработало: {', '.join(triggered)}\n"
+
+    if has_profanity:
+        report += "🤬 Обнаружен мат\n"
+
+    if has_links(test_text):
+        report += "🔗 Содержит ссылки\n"
+
+    # Детали по признакам
+    report += "\n<b>Признаки:</b>\n"
+    for feat, val in sorted(features.items(), key=lambda x: -x[1]):
+        if val > 0:
+            report += f"• {feat}: {val:.2f}\n"
+
+    await message.answer(report, parse_mode="HTML")
+
+
+@router.message(Command("spam_lockdown"))
+async def cmd_lockdown(message: Message):
+    """Управление режимом блокировки (антирейд)"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.text.split()
+
+    if len(args) < 2:
+        current = "🔴 АКТИВЕН" if raid_detector.lockdown_active else "🟢 неактивен"
+        await message.answer(
+            f"🚨 <b>Режим блокировки (антирейд)</b>\n\n"
+            f"Статус: {current}\n\n"
+            f"Использование:\n"
+            f"/spam_lockdown on — включить блокировку\n"
+            f"/spam_lockdown off — выключить блокировку\n\n"
+            f"При включённой блокировке все новые участники "
+            f"автоматически кикаются.",
+            parse_mode="HTML"
+        )
+        return
+
+    action = args[1].lower()
+
+    if action in ["on", "1", "true", "да"]:
+        raid_detector.lockdown_active = True
+        await message.answer("🔴 <b>Блокировка ВКЛЮЧЕНА!</b>\nВсе новые участники будут кикнуты.", parse_mode="HTML")
+        await notify_admins("🚨 Режим блокировки ВКЛЮЧЁН администратором!")
+    elif action in ["off", "0", "false", "нет"]:
+        raid_detector.lockdown_active = False
+        await message.answer("🟢 <b>Блокировка ВЫКЛЮЧЕНА</b>\nНовые участники проходят верификацию.", parse_mode="HTML")
+        await notify_admins("✅ Режим блокировки выключен")
+    else:
+        await message.answer("❌ Используйте: /spam_lockdown on или /spam_lockdown off")
+
+
 @router.message(Command("spam_help"))
 async def cmd_help(message: Message):
     """Помощь по командам"""
@@ -1344,27 +1506,27 @@ async def cmd_help(message: Message):
         return
 
     await message.answer(
-        "🤖 <b>Команды спам-фильтра v3.0</b>\n\n"
-        "<b>Статистика:</b>\n"
+        "🎙 <b>БИМ радио — Команды антиспам бота v3.0</b>\n\n"
+        "<b>📊 Статистика:</b>\n"
         "/spam_stats — статистика бота\n\n"
-        "<b>Ключевые слова:</b>\n"
-        "/spam_add <слово> — добавить стоп-слово\n\n"
-        "<b>Пользователи:</b>\n"
+        "<b>🔍 Тестирование:</b>\n"
+        "/spam_test <текст> — проверить текст на спам\n\n"
+        "<b>📝 Управление:</b>\n"
+        "/spam_add <слово> — добавить стоп-слово\n"
         "/spam_whitelist — управление whitelist\n"
         "/spam_warn <id> — проверить предупреждения\n"
         "/spam_unban <id> — разбанить пользователя\n\n"
-        "<b>Возможности v3.0:</b>\n"
-        "• ✅ Верификация с правилами\n"
-        "• 🛡 CAS интеграция\n"
-        "• ⚠️ Авто-бан (5 предупреждений)\n"
-        "• 🌙 Ночной режим (23-07)\n"
-        "• 📝 Whitelist\n"
-        "• 🔔 Уведомления админам\n"
-        "• ⏳ Slow mode для новичков\n"
-        "• 🔗 Ограничение ссылок\n"
-        "• 🤖 ML классификатор\n"
-        "• 📷 OCR для фото\n"
-        "• 🤬 Мат-фильтр",
+        "<b>🚨 Антирейд:</b>\n"
+        "/spam_lockdown — управление блокировкой\n\n"
+        "<b>🛡 Возможности:</b>\n"
+        "• Верификация с правилами БИМ радио\n"
+        "• CAS (Combot Anti-Spam)\n"
+        "• Авто-бан после 5 предупреждений\n"
+        "• Ночной режим (23:00-07:00)\n"
+        "• Антирейд защита\n"
+        "• ML классификатор спама\n"
+        "• OCR для картинок\n"
+        "• Мат-фильтр",
         parse_mode="HTML"
     )
 
@@ -1378,23 +1540,21 @@ async def cmd_start(message: Message):
     is_admin = message.from_user.id in ADMIN_IDS
 
     await message.answer(
-        "🛡 <b>Спам-фильтр бот v3.0</b>\n\n"
-        "Я защищаю чаты от спама и ботов.\n\n"
-        "<b>Что я умею:</b>\n"
-        "• Верификация с правилами чата\n"
-        "• CAS (Combot Anti-Spam) проверка\n"
-        "• Авто-бан после 5 предупреждений\n"
-        "• Ночной режим (23:00-07:00)\n"
-        "• Whitelist для доверенных\n"
-        "• Slow mode для новичков\n"
-        "• Ограничение ссылок/пересылок\n"
-        "• ML классификация спама\n"
-        "• OCR для изображений\n"
-        "• Мат-фильтр\n\n"
-        "<b>Как подключить:</b>\n"
-        "1. Добавьте меня в группу\n"
-        "2. Назначьте администратором\n"
-        "3. Дайте права: удалять сообщения, банить\n\n"
+        "🎙 <b>БИМ радио 102.8 FM — Антиспам бот v3.0</b>\n\n"
+        "Привет! Я защищаю чат нашей радиостанции от спама и ботов.\n\n"
+        "<b>Мои суперсилы:</b>\n"
+        "🎵 Верификация новых слушателей\n"
+        "🛡 CAS (Combot Anti-Spam) проверка\n"
+        "⚠️ Авто-бан после 5 предупреждений\n"
+        "🌙 Ночной режим (23:00-07:00)\n"
+        "📝 Whitelist для доверенных\n"
+        "⏳ Slow mode для новичков\n"
+        "🔗 Защита от спам-ссылок\n"
+        "🤖 ML классификация спама\n"
+        "📷 Распознавание текста на картинках\n"
+        "🤬 Мат-фильтр\n"
+        "🚨 Антирейд защита\n\n"
+        "📻 <b>Слушай БИМ радио 102.8 FM!</b>\n\n"
         + ("👑 <b>Вы администратор бота</b>\n"
            "/spam_help — все команды" if is_admin else ""),
         parse_mode="HTML"
