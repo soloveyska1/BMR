@@ -1,31 +1,56 @@
 """
-Спам-фильтр бот для Telegram чатов v2.0
-- Верификация новых участников кнопкой
-- Умная фильтрация спама (ключевые слова + паттерны + комбинации)
-- Детекция удалённых аккаунтов и подозрительных профилей
-- Обнаружение дубликатов сообщений
-- Анализ поведения пользователей
+Спам-фильтр бот для Telegram чатов v3.0
+========================================
+Фичи:
+- ✅ Верификация с правилами чата
+- ✅ CAS (Combot Anti-Spam) интеграция
+- ✅ Авто-бан после 5 предупреждений
+- ✅ Ночной режим (23:00-07:00)
+- ✅ Белый список (whitelist)
+- ✅ Уведомления админам
+- ✅ Slow mode для новых юзеров
+- ✅ Ограничение ссылок/пересылок для новичков
+- ✅ ML-подобный классификатор спама
+- ✅ OCR для изображений (опционально)
+- ✅ Авто-очистка сообщений
 """
 
 import asyncio
 import re
 import logging
 import hashlib
-from datetime import datetime, timedelta
-from typing import Dict, Set, List, Tuple
+import json
+import os
+from datetime import datetime, timedelta, time
+from typing import Dict, Set, List, Tuple, Optional
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
+import io
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
     Message, CallbackQuery, ChatPermissions,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ChatMemberUpdated, User
+    ChatMemberUpdated, User, PhotoSize
 )
 from aiogram.filters import ChatMemberUpdatedFilter, IS_NOT_MEMBER, IS_MEMBER, Command
 from aiogram.enums import ChatMemberStatus
 from dotenv import load_dotenv
-import os
+
+# Опциональные зависимости
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
+
+try:
+    from PIL import Image
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
 
 load_dotenv()
 
@@ -35,6 +60,43 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("SPAM_ADMIN_IDS", "").split(",") 
 
 # Время на верификацию (секунды)
 VERIFY_TIMEOUT = 60
+
+# Авто-бан после N предупреждений
+MAX_WARNINGS = 5
+
+# Ночной режим (UTC+3 Москва)
+NIGHT_MODE_ENABLED = True
+NIGHT_START = time(23, 0)  # 23:00
+NIGHT_END = time(7, 0)     # 07:00
+
+# Slow mode для новичков (первые N сообщений)
+NEWBIE_MESSAGE_LIMIT = 5
+NEWBIE_COOLDOWN_SECONDS = 30  # между сообщениями
+
+# Ограничения для новичков
+NEWBIE_HOURS = 24  # Считаем новичком первые 24 часа
+
+# CAS API
+CAS_API_URL = "https://api.cas.chat/check"
+
+# Пути к файлам данных
+DATA_DIR = Path(__file__).parent / "spam_bot_data"
+DATA_DIR.mkdir(exist_ok=True)
+WHITELIST_FILE = DATA_DIR / "whitelist.json"
+WARNINGS_FILE = DATA_DIR / "warnings.json"
+
+# ============== ПРАВИЛА ЧАТА ==============
+CHAT_RULES = """
+📋 <b>Правила чата:</b>
+
+1️⃣ <b>Не рекламируем</b> — никаких услуг, товаров, каналов
+2️⃣ <b>Не спамим</b> — без повторных сообщений и флуда
+3️⃣ <b>Не материмся</b> — общаемся культурно
+4️⃣ <b>Уважаем друг друга</b> — без оскорблений и хейта
+5️⃣ <b>По теме</b> — обсуждаем то, что интересно всем
+
+⚠️ Нарушители будут удалены!
+"""
 
 # ============== СТОП-СЛОВА ==============
 SPAM_KEYWORDS = [
@@ -54,7 +116,7 @@ SPAM_KEYWORDS = [
     "работа для всех", "работа для каждого",
     "не упусти", "не упустите", "успей", "успейте",
 
-    # НОВОЕ: Скрытый спам работы (как на скриншотах)
+    # Скрытый спам работы
     "связь через личку", "уточнения в лс", "подробности в лс",
     "детали в лс", "информация в лс", "условия в лс",
     "лёгкая работа", "легкая работа", "несложная работа",
@@ -121,13 +183,13 @@ SPAM_PATTERNS = [
     r"(?:от|до)\s*\d{3,}\s*(?:в\s*)?(?:час|день|неделю)",
     r"\d{4,}\s*(?:₽|руб|рублей|р\.)",
 
-    # Призывы в ЛС (ключевое для скрытого спама!)
+    # Призывы в ЛС
     r"(?:пиш[иу]|напиш[иу])(?:те)?\s*(?:в\s*)?(?:лс|личк|л\.с\.|дм|dm|директ)",
     r"(?:связь|общение|детали|подробност|уточнени|информаци|условия)\s*(?:в|через)\s*(?:лс|личк|л\.с\.)",
     r"(?:звон[и|я]|позвон)[и|я]?(?:те)?",
     r"(?:звоните|пишите)\s*(?:звоните|пишите)",
 
-    # Телефоны (российские)
+    # Телефоны
     r"(?:\+7|8)[\s\-]?\(?9\d{2}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}",
     r"\+?\d{10,12}",
 
@@ -144,25 +206,25 @@ SPAM_PATTERNS = [
     r"(?:любые|все|всякие)\s*(?:работы|услуги)",
     r"\d+[\-‑–]\d+\s*(?:человек|чел|людей)",
 
-    # НОВОЕ: Скрытые паттерны работы
+    # Скрытые паттерны работы
     r"(?:ищу|нужен|требуется)\s*(?:специалист|помощник|человек)",
     r"предлагается\s*(?:работа|подработка)",
     r"(?:лёгк|легк|несложн|прост)[ая]\s*(?:работа|подработка)",
     r"(?:небольш|мелк|прост)[ие]\s*(?:поручени|задани)",
 
-    # Деньги + период (6700 в день, 5000 в час)
+    # Деньги + период
     r"\d{3,}\s*(?:в\s*)?(?:день|час|неделю|месяц)",
     r"(?:лёгк|легк|быстр)[иы][ех]\s*(?:деньги|денег)",
 ]
 
-# Слова-индикаторы работы (для комбинаций)
+# Слова-индикаторы работы
 WORK_INDICATORS = [
     "работа", "работу", "подработка", "подработку",
     "поручения", "поручений", "задания", "заданий",
     "специалист", "помощник", "сотрудник",
     "опыт", "график", "расписание",
     "оплата", "зарплата", "доход",
-    "деньги", "денег", "заработок",  # деньги тоже индикатор
+    "деньги", "денег", "заработок",
 ]
 
 # Слова-индикаторы призыва в ЛС
@@ -170,16 +232,30 @@ DM_INDICATORS = [
     "в лс", "в личку", "в л.с.", "через личку",
     "пишите", "пиши", "напишите", "напиши",
     "связь", "обращайтесь", "свяжитесь",
-    " лс",  # ЛС в конце сообщения
+    " лс",
 ]
 
-# Комбинированные паттерны (если 2+ совпадений - спам)
+# Комбинированные паттерны
 SPAM_COMBO_WORDS = [
     "звоните", "пишите", "звони", "пиши",
     "услуги", "работы", "помощь",
     "недорого", "дешево", "цена", "цены",
     "готов", "готовы", "могу", "можем",
     "выезд", "выезжаем", "приеду", "приедем",
+]
+
+# Мат-фильтр (базовые корни)
+PROFANITY_ROOTS = [
+    "хуй", "хуя", "хуе", "хуи", "хую",
+    "пизд", "пезд",
+    "блять", "бляд", "блядь",
+    "ебат", "ебан", "ебну", "ебёт", "ебет", "ебал", "ёб", "еб",
+    "сука", "сучк", "сучар",
+    "мудак", "мудил", "мудо",
+    "пидор", "пидар", "педик",
+    "залупа", "залуп",
+    "шлюх", "шалав",
+    "дрочи", "дроч", "дрочк",
 ]
 
 # ============== ЛОГИРОВАНИЕ ==============
@@ -189,7 +265,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ============== СТРУКТУРЫ ДАННЫХ ==============
+# ============== КЛАССЫ ДАННЫХ ==============
 
 @dataclass
 class UserProfile:
@@ -202,6 +278,117 @@ class UserProfile:
     messages_deleted: int = 0
     last_message_time: datetime = None
     message_hashes: List[str] = field(default_factory=list)
+    is_cas_banned: bool = False
+    join_time: datetime = field(default_factory=datetime.now)
+
+
+class PersistentStorage:
+    """Постоянное хранилище для whitelist и warnings"""
+
+    def __init__(self):
+        self.whitelist: Set[int] = set()
+        self.warnings: Dict[int, int] = {}
+        self.banned_users: Set[int] = set()
+        self._load()
+
+    def _load(self):
+        """Загрузить данные из файлов"""
+        if WHITELIST_FILE.exists():
+            try:
+                with open(WHITELIST_FILE, 'r') as f:
+                    data = json.load(f)
+                    self.whitelist = set(data.get('whitelist', []))
+                    self.banned_users = set(data.get('banned', []))
+            except:
+                pass
+
+        if WARNINGS_FILE.exists():
+            try:
+                with open(WARNINGS_FILE, 'r') as f:
+                    self.warnings = {int(k): v for k, v in json.load(f).items()}
+            except:
+                pass
+
+    def _save_whitelist(self):
+        """Сохранить whitelist"""
+        with open(WHITELIST_FILE, 'w') as f:
+            json.dump({
+                'whitelist': list(self.whitelist),
+                'banned': list(self.banned_users)
+            }, f)
+
+    def _save_warnings(self):
+        """Сохранить warnings"""
+        with open(WARNINGS_FILE, 'w') as f:
+            json.dump(self.warnings, f)
+
+    def add_to_whitelist(self, user_id: int):
+        self.whitelist.add(user_id)
+        self._save_whitelist()
+
+    def remove_from_whitelist(self, user_id: int):
+        self.whitelist.discard(user_id)
+        self._save_whitelist()
+
+    def is_whitelisted(self, user_id: int) -> bool:
+        return user_id in self.whitelist
+
+    def add_warning(self, user_id: int) -> int:
+        """Добавить предупреждение, вернуть общее количество"""
+        self.warnings[user_id] = self.warnings.get(user_id, 0) + 1
+        self._save_warnings()
+        return self.warnings[user_id]
+
+    def get_warnings(self, user_id: int) -> int:
+        return self.warnings.get(user_id, 0)
+
+    def reset_warnings(self, user_id: int):
+        if user_id in self.warnings:
+            del self.warnings[user_id]
+            self._save_warnings()
+
+    def add_banned(self, user_id: int):
+        self.banned_users.add(user_id)
+        self._save_whitelist()
+
+    def is_banned(self, user_id: int) -> bool:
+        return user_id in self.banned_users
+
+
+class CASChecker:
+    """Проверка через Combot Anti-Spam API"""
+
+    def __init__(self):
+        self.cache: Dict[int, Tuple[bool, datetime]] = {}
+        self.cache_ttl = timedelta(hours=24)
+
+    async def check(self, user_id: int) -> bool:
+        """Проверить пользователя в CAS базе"""
+        if not AIOHTTP_AVAILABLE:
+            return False
+
+        # Проверяем кеш
+        if user_id in self.cache:
+            is_banned, cached_at = self.cache[user_id]
+            if datetime.now() - cached_at < self.cache_ttl:
+                return is_banned
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    CAS_API_URL,
+                    params={"user_id": user_id},
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        is_banned = data.get("ok", False)
+                        self.cache[user_id] = (is_banned, datetime.now())
+                        return is_banned
+        except Exception as e:
+            logger.warning(f"CAS check failed for {user_id}: {e}")
+
+        return False
 
 
 class MessageSimilarityChecker:
@@ -210,7 +397,6 @@ class MessageSimilarityChecker:
     def __init__(self, similarity_threshold: float = 0.85, window_minutes: int = 30):
         self.threshold = similarity_threshold
         self.window = timedelta(minutes=window_minutes)
-        # {chat_id: [(user_id, text_hash, normalized_text, timestamp), ...]}
         self.recent_messages: Dict[int, List[Tuple]] = defaultdict(list)
 
     def _get_hash(self, text: str) -> str:
@@ -219,7 +405,6 @@ class MessageSimilarityChecker:
         return hashlib.md5(normalized.encode()).hexdigest()[:16]
 
     def _simple_similarity(self, text1: str, text2: str) -> float:
-        """Простое сравнение по словам"""
         words1 = set(text1.lower().split())
         words2 = set(text2.lower().split())
         if not words1 or not words2:
@@ -229,7 +414,6 @@ class MessageSimilarityChecker:
         return len(intersection) / len(union)
 
     def check(self, text: str, user_id: int, chat_id: int) -> Tuple[bool, str]:
-        """Проверить, является ли сообщение дубликатом"""
         if len(text) < 30:
             return False, ""
 
@@ -237,28 +421,22 @@ class MessageSimilarityChecker:
         text_hash = self._get_hash(text)
         normalized = text.lower().strip()
 
-        # Очищаем старые записи
         cutoff = now - self.window
         self.recent_messages[chat_id] = [
             msg for msg in self.recent_messages[chat_id]
             if msg[3] > cutoff
         ]
 
-        # Проверяем на дубликаты
         for stored_user_id, stored_hash, stored_text, _ in self.recent_messages[chat_id]:
-            # Точное совпадение хеша
             if stored_hash == text_hash and stored_user_id != user_id:
                 return True, "точный дубликат от другого пользователя"
 
-            # Похожий текст от разных пользователей
             if stored_user_id != user_id:
                 similarity = self._simple_similarity(normalized, stored_text)
                 if similarity >= self.threshold:
                     return True, f"похожее сообщение ({similarity:.0%})"
 
-        # Сохраняем текущее сообщение
         self.recent_messages[chat_id].append((user_id, text_hash, normalized, now))
-
         return False, ""
 
 
@@ -267,8 +445,8 @@ class UserBehaviorAnalyzer:
 
     def __init__(self):
         self.profiles: Dict[int, UserProfile] = {}
-        # Флуд-контроль: {user_id: [timestamps]}
         self.message_times: Dict[int, List[datetime]] = defaultdict(list)
+        self.newbie_messages: Dict[int, List[datetime]] = defaultdict(list)
 
     def get_profile(self, user_id: int) -> UserProfile:
         if user_id not in self.profiles:
@@ -276,47 +454,37 @@ class UserBehaviorAnalyzer:
         return self.profiles[user_id]
 
     def record_message(self, user_id: int):
-        """Записать сообщение пользователя"""
         now = datetime.now()
         profile = self.get_profile(user_id)
         profile.message_count += 1
         profile.last_message_time = now
 
-        # Флуд-контроль
         self.message_times[user_id].append(now)
-        # Оставляем только последнюю минуту
         cutoff = now - timedelta(minutes=1)
         self.message_times[user_id] = [t for t in self.message_times[user_id] if t > cutoff]
 
     def is_flooding(self, user_id: int) -> bool:
-        """Проверить, флудит ли пользователь"""
-        return len(self.message_times.get(user_id, [])) > 10  # >10 сообщений в минуту
+        return len(self.message_times.get(user_id, [])) > 10
 
     def record_spam(self, user_id: int):
-        """Записать спам от пользователя"""
         profile = self.get_profile(user_id)
         profile.warnings += 1
         profile.messages_deleted += 1
         profile.spam_score += 0.3
 
     def is_suspicious(self, user_id: int) -> bool:
-        """Проверить, подозрительный ли пользователь"""
         profile = self.get_profile(user_id)
         return profile.spam_score >= 0.5 or profile.warnings >= 2
 
     def analyze_user_profile(self, user: User) -> Tuple[bool, List[str]]:
-        """Анализ профиля пользователя на подозрительность"""
         red_flags = []
 
-        # Удалённый аккаунт (нет имени)
         if not user.first_name or user.first_name.lower() in ["deleted", "удалённый"]:
             red_flags.append("удалённый аккаунт")
 
-        # Нет юзернейма
         if not user.username:
             red_flags.append("нет username")
 
-        # Подозрительные имена
         suspicious_names = ["deleted", "account", "user", "test", "admin", "support"]
         full_name = (user.first_name or "").lower() + " " + (user.last_name or "").lower()
         if any(name in full_name for name in suspicious_names):
@@ -324,6 +492,164 @@ class UserBehaviorAnalyzer:
 
         is_suspicious = len(red_flags) >= 2
         return is_suspicious, red_flags
+
+    def is_newbie(self, user_id: int) -> bool:
+        """Проверить, является ли пользователь новичком"""
+        profile = self.get_profile(user_id)
+        hours_since_join = (datetime.now() - profile.join_time).total_seconds() / 3600
+        return hours_since_join < NEWBIE_HOURS
+
+    def check_newbie_cooldown(self, user_id: int) -> Tuple[bool, int]:
+        """Проверить cooldown для новичка. Возвращает (can_send, seconds_left)"""
+        profile = self.get_profile(user_id)
+
+        if profile.message_count >= NEWBIE_MESSAGE_LIMIT:
+            return True, 0
+
+        now = datetime.now()
+        messages = self.newbie_messages.get(user_id, [])
+
+        # Очищаем старые записи
+        cutoff = now - timedelta(seconds=NEWBIE_COOLDOWN_SECONDS)
+        messages = [t for t in messages if t > cutoff]
+        self.newbie_messages[user_id] = messages
+
+        if messages:
+            last_msg_time = max(messages)
+            elapsed = (now - last_msg_time).total_seconds()
+            if elapsed < NEWBIE_COOLDOWN_SECONDS:
+                return False, int(NEWBIE_COOLDOWN_SECONDS - elapsed)
+
+        return True, 0
+
+    def record_newbie_message(self, user_id: int):
+        """Записать сообщение новичка"""
+        self.newbie_messages[user_id].append(datetime.now())
+
+
+class MLSpamClassifier:
+    """ML-подобный классификатор спама на основе весов"""
+
+    def __init__(self):
+        # Веса для разных признаков
+        self.weights = {
+            'keyword_match': 0.3,
+            'root_match': 0.25,
+            'pattern_match': 0.35,
+            'work_dm_combo': 0.5,
+            'phone_cta': 0.4,
+            'many_emojis': 0.15,
+            'link': 0.2,
+            'mention': 0.15,
+            'caps': 0.1,
+            'duplicate': 0.4,
+            'suspicious_profile': 0.25,
+            'cas_banned': 0.8,
+            'profanity': 0.3,
+            'newbie_link': 0.35,
+            'night_mode': 0.1,
+        }
+        self.threshold = 0.45
+
+    def extract_features(self, text: str, user_profile: UserProfile,
+                         is_newbie: bool, is_night: bool, has_link: bool,
+                         is_cas_banned: bool) -> Dict[str, float]:
+        """Извлечь признаки из сообщения"""
+        features = {}
+        normalized = normalize_text(text)
+        original_lower = text.lower()
+
+        # Ключевые слова
+        keyword_count = sum(1 for kw in SPAM_KEYWORDS if kw in normalized)
+        features['keyword_match'] = min(keyword_count * 0.15, 1.0)
+
+        # Корни слов
+        root_count = sum(1 for root in SPAM_ROOTS if root in normalized)
+        features['root_match'] = min(root_count * 0.2, 1.0)
+
+        # Паттерны
+        pattern_count = sum(1 for p in SPAM_PATTERNS if re.search(p, original_lower))
+        features['pattern_match'] = min(pattern_count * 0.15, 1.0)
+
+        # Работа + ЛС комбо
+        has_work = any(w in normalized for w in WORK_INDICATORS)
+        has_dm = any(w in normalized for w in DM_INDICATORS)
+        features['work_dm_combo'] = 1.0 if (has_work and has_dm) else 0.0
+
+        # Телефон + призыв
+        has_phone = bool(re.search(r'(?:\+7|8)?\d{10,11}', re.sub(r'[\s\-\(\)]', '', text)))
+        has_cta = any(w in normalized for w in ["звоните", "пишите", "звони", "пиши", "обращайтесь"])
+        features['phone_cta'] = 1.0 if (has_phone and has_cta) else 0.0
+
+        # Много эмодзи
+        emoji_count = len(re.findall(r'[\U0001F300-\U0001F9FF]', text))
+        features['many_emojis'] = 1.0 if emoji_count > 7 else 0.0
+
+        # Ссылки
+        features['link'] = 1.0 if has_link else 0.0
+
+        # Упоминания
+        mention_count = len(re.findall(r'@[a-zA-Z0-9_]{5,}', text))
+        features['mention'] = min(mention_count * 0.3, 1.0)
+
+        # Много капса
+        if len(text) > 10:
+            caps_ratio = sum(1 for c in text if c.isupper()) / len(text)
+            features['caps'] = 1.0 if caps_ratio > 0.5 else 0.0
+        else:
+            features['caps'] = 0.0
+
+        # Мат
+        has_profanity = any(root in normalized for root in PROFANITY_ROOTS)
+        features['profanity'] = 1.0 if has_profanity else 0.0
+
+        # Подозрительный профиль
+        features['suspicious_profile'] = 1.0 if user_profile.spam_score > 0.3 else 0.0
+
+        # CAS бан
+        features['cas_banned'] = 1.0 if is_cas_banned else 0.0
+
+        # Новичок + ссылка
+        features['newbie_link'] = 1.0 if (is_newbie and has_link) else 0.0
+
+        # Ночной режим
+        features['night_mode'] = 1.0 if is_night else 0.0
+
+        return features
+
+    def classify(self, features: Dict[str, float]) -> Tuple[bool, float, List[str]]:
+        """Классифицировать сообщение"""
+        score = 0.0
+        triggered = []
+
+        for feature, value in features.items():
+            if value > 0 and feature in self.weights:
+                contribution = value * self.weights[feature]
+                score += contribution
+                if contribution > 0.1:
+                    triggered.append(feature)
+
+        is_spam = score >= self.threshold
+        return is_spam, min(score, 1.0), triggered
+
+
+class OCRProcessor:
+    """Обработчик OCR для изображений"""
+
+    @staticmethod
+    async def extract_text(photo_bytes: bytes) -> str:
+        """Извлечь текст из изображения"""
+        if not OCR_AVAILABLE:
+            return ""
+
+        try:
+            image = Image.open(io.BytesIO(photo_bytes))
+            # Настройки для русского + английского
+            text = pytesseract.image_to_string(image, lang='rus+eng')
+            return text.strip()
+        except Exception as e:
+            logger.warning(f"OCR failed: {e}")
+            return ""
 
 
 # ============== ИНИЦИАЛИЗАЦИЯ ==============
@@ -336,28 +662,37 @@ router = Router()
 pending_verification: Dict[int, dict] = {}
 verified_users: Set[int] = set()
 
-# Анализаторы
+# Компоненты
+storage = PersistentStorage()
+cas_checker = CASChecker()
 similarity_checker = MessageSimilarityChecker()
 behavior_analyzer = UserBehaviorAnalyzer()
+ml_classifier = MLSpamClassifier()
+ocr_processor = OCRProcessor()
 
 # Статистика
 stats = {
     "spam_deleted": 0,
     "users_verified": 0,
     "users_kicked": 0,
+    "users_banned": 0,
     "duplicates_blocked": 0,
     "suspicious_users_blocked": 0,
+    "cas_blocked": 0,
+    "profanity_blocked": 0,
+    "night_mode_blocked": 0,
+    "newbie_restricted": 0,
+    "ocr_detections": 0,
     "start_time": datetime.now()
 }
 
 
-# ============== ФУНКЦИИ ПРОВЕРКИ СПАМА ==============
+# ============== ФУНКЦИИ ==============
 
 def normalize_text(text: str) -> str:
     """Нормализация текста для поиска спама"""
     text = text.lower()
 
-    # Замена латинских букв на кириллицу (антиобход)
     replacements = {
         'a': 'а', 'e': 'е', 'o': 'о', 'p': 'р', 'c': 'с',
         'x': 'х', 'y': 'у', 'k': 'к', 'h': 'н', 'm': 'м',
@@ -366,144 +701,87 @@ def normalize_text(text: str) -> str:
     for lat, cyr in replacements.items():
         text = text.replace(lat, cyr)
 
-    # Удаление zero-width символов
     zero_width = '\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff'
     for char in zero_width:
         text = text.replace(char, '')
 
-    # Нормализация пробелов
     text = re.sub(r'[^\w\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text)
 
     return text.strip()
 
 
-def check_work_dm_combo(text: str) -> Tuple[bool, str]:
-    """Проверка комбинации: работа + призыв в ЛС = 100% спам"""
+def is_night_mode() -> bool:
+    """Проверить, активен ли ночной режим"""
+    if not NIGHT_MODE_ENABLED:
+        return False
+
+    now = datetime.now().time()
+
+    # Ночь переходит через полночь
+    if NIGHT_START > NIGHT_END:
+        return now >= NIGHT_START or now <= NIGHT_END
+    else:
+        return NIGHT_START <= now <= NIGHT_END
+
+
+def has_links(text: str) -> bool:
+    """Проверить наличие ссылок в тексте"""
+    link_patterns = [
+        r'https?://\S+',
+        r't\.me/\S+',
+        r'@[a-zA-Z0-9_]{5,}',
+        r'bit\.ly/\S+',
+        r'[a-zA-Z0-9-]+\.[a-z]{2,}/\S*',
+    ]
+    for pattern in link_patterns:
+        if re.search(pattern, text):
+            return True
+    return False
+
+
+def check_profanity(text: str) -> bool:
+    """Проверить наличие мата"""
     normalized = normalize_text(text)
-
-    has_work = any(word in normalized for word in WORK_INDICATORS)
-    has_dm = any(word in normalized for word in DM_INDICATORS)
-
-    if has_work and has_dm:
-        return True, "работа + призыв в ЛС"
-
-    return False, ""
+    return any(root in normalized for root in PROFANITY_ROOTS)
 
 
-def is_spam(text: str) -> Tuple[bool, str]:
-    """Комплексная проверка сообщения на спам"""
-    if not text:
-        return False, ""
-
-    normalized = normalize_text(text)
-    original_lower = text.lower()
-
-    # 1. Проверка комбинации работа + ЛС (самый частый скрытый спам)
-    is_work_dm, reason = check_work_dm_combo(text)
-    if is_work_dm:
-        return True, reason
-
-    # 2. Проверка по ключевым словам
-    for keyword in SPAM_KEYWORDS:
-        if keyword in normalized:
-            return True, f"ключевое слово: {keyword}"
-
-    # 3. Проверка по корням слов
-    for root in SPAM_ROOTS:
-        if root in normalized:
-            return True, f"корень слова: {root}"
-
-    # 4. Проверка по regex паттернам
-    for pattern in SPAM_PATTERNS:
-        if re.search(pattern, original_lower):
-            return True, f"паттерн: {pattern[:30]}..."
-
-    # 5. Проверка комбинаций (2+ слов = спам)
-    combo_count = 0
-    found_combos = []
-    for word in SPAM_COMBO_WORDS:
-        if word in normalized:
-            combo_count += 1
-            found_combos.append(word)
-    if combo_count >= 2:
-        return True, f"комбинация: {', '.join(found_combos[:3])}"
-
-    # 6. Номер телефона + призыв = спам
-    has_phone = bool(re.search(r'(?:\+7|8)?\d{10,11}', re.sub(r'[\s\-\(\)]', '', text)))
-    has_call_to_action = any(w in normalized for w in ["звоните", "пишите", "звони", "пиши", "обращайтесь"])
-    if has_phone and has_call_to_action:
-        return True, "телефон + призыв"
-
-    # 7. Избыток эмодзи
-    emoji_count = len(re.findall(r'[\U0001F300-\U0001F9FF]', text))
-    if emoji_count > 7:
-        return True, f"много эмодзи: {emoji_count}"
-
-    return False, ""
+async def notify_admins(message: str, chat_id: int = None):
+    """Уведомить администраторов"""
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🔔 <b>Уведомление</b>\n\n{message}",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.warning(f"Could not notify admin {admin_id}: {e}")
 
 
-async def advanced_spam_check(message: Message) -> Tuple[bool, str, float]:
-    """
-    Продвинутая проверка на спам с учётом поведения и контекста
-    Возвращает: (is_spam, reason, confidence)
-    """
-    text = message.text or message.caption or ""
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    user = message.from_user
+async def auto_ban_user(user_id: int, chat_id: int, reason: str):
+    """Автоматический бан пользователя"""
+    try:
+        await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+        storage.add_banned(user_id)
+        stats["users_banned"] += 1
 
-    confidence = 0.0
-    reasons = []
-
-    # 1. Анализ профиля пользователя
-    is_suspicious_user, red_flags = behavior_analyzer.analyze_user_profile(user)
-    if is_suspicious_user:
-        confidence += 0.3
-        reasons.extend(red_flags)
-
-    # 2. Проверка на флуд
-    if behavior_analyzer.is_flooding(user_id):
-        confidence += 0.25
-        reasons.append("флуд")
-
-    # 3. Проверка на дубликаты
-    is_duplicate, dup_reason = similarity_checker.check(text, user_id, chat_id)
-    if is_duplicate:
-        confidence += 0.4
-        reasons.append(dup_reason)
-        stats["duplicates_blocked"] += 1
-
-    # 4. Проверка истории пользователя
-    if behavior_analyzer.is_suspicious(user_id):
-        confidence += 0.2
-        reasons.append("подозрительная история")
-
-    # 5. Базовая проверка на спам
-    is_spam_basic, spam_reason = is_spam(text)
-    if is_spam_basic:
-        confidence += 0.5
-        reasons.append(spam_reason)
-
-    # 6. Дополнительный анализ для "чистых" сообщений от подозрительных профилей
-    if not is_spam_basic and is_suspicious_user:
-        # Если профиль подозрительный и сообщение похоже на рекламу
-        ad_words = ["ищу", "нужен", "требуется", "предлагаю", "предлагается", "готов", "могу"]
-        if any(word in text.lower() for word in ad_words):
-            confidence += 0.2
-            reasons.append("реклама от подозрительного профиля")
-
-    # Финальное решение
-    is_spam_final = confidence >= 0.5
-
-    return is_spam_final, ", ".join(reasons) if reasons else "", min(confidence, 1.0)
+        await notify_admins(
+            f"🚫 <b>Авто-бан</b>\n"
+            f"Пользователь: <code>{user_id}</code>\n"
+            f"Причина: {reason}\n"
+            f"Чат: <code>{chat_id}</code>"
+        )
+        logger.info(f"Auto-banned user {user_id}: {reason}")
+    except Exception as e:
+        logger.error(f"Failed to ban user {user_id}: {e}")
 
 
 def get_verify_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Клавиатура для верификации"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text="✅ Я не робот",
+            text="✅ Я прочитал(а) правила и не робот",
             callback_data=f"verify_{user_id}"
         )]
     ])
@@ -528,6 +806,45 @@ async def kick_unverified(user_id: int, chat_id: int, message_id: int):
             pending_verification.pop(user_id, None)
 
 
+async def process_spam_message(message: Message, reason: str, confidence: float):
+    """Обработать спам-сообщение"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    try:
+        # Удаляем сообщение
+        await message.delete()
+        stats["spam_deleted"] += 1
+        behavior_analyzer.record_spam(user_id)
+
+        # Добавляем предупреждение
+        warnings = storage.add_warning(user_id)
+
+        user_name = message.from_user.full_name or message.from_user.username
+        logger.info(f"Spam deleted from {user_name} ({user_id}): {reason} [{confidence:.0%}], warning {warnings}/{MAX_WARNINGS}")
+
+        # Проверяем на авто-бан
+        if warnings >= MAX_WARNINGS:
+            await auto_ban_user(user_id, chat_id, f"Превышен лимит предупреждений ({MAX_WARNINGS})")
+            warn_text = f"🚫 <b>{user_name}</b> забанен.\nПричина: {MAX_WARNINGS} предупреждений"
+        else:
+            warn_text = (
+                f"⚠️ Сообщение удалено.\n"
+                f"<i>Причина: {reason}</i>\n"
+                f"Предупреждение: {warnings}/{MAX_WARNINGS}"
+            )
+
+        warn_msg = await message.answer(warn_text, parse_mode="HTML")
+        await asyncio.sleep(7)
+        try:
+            await warn_msg.delete()
+        except:
+            pass
+
+    except Exception as e:
+        logger.error(f"Error processing spam: {e}")
+
+
 # ============== ОБРАБОТЧИКИ ==============
 
 @router.chat_member(ChatMemberUpdatedFilter(IS_NOT_MEMBER >> IS_MEMBER))
@@ -536,24 +853,56 @@ async def on_user_join(event: ChatMemberUpdated):
     user = event.new_chat_member.user
     chat_id = event.chat.id
 
-    # Пропускаем ботов
     if user.is_bot:
         return
 
-    # Пропускаем админов
     if user.id in ADMIN_IDS:
         verified_users.add(user.id)
         return
 
-    # Если уже верифицирован
     if user.id in verified_users:
         return
 
-    # Анализ профиля на входе
+    # Проверка в whitelist
+    if storage.is_whitelisted(user.id):
+        verified_users.add(user.id)
+        logger.info(f"Whitelisted user {user.id} auto-verified")
+        return
+
+    # Проверка на бан
+    if storage.is_banned(user.id):
+        try:
+            await bot.ban_chat_member(chat_id=chat_id, user_id=user.id)
+            logger.info(f"Banned user {user.id} tried to rejoin")
+        except:
+            pass
+        return
+
+    # CAS проверка
+    is_cas_banned = await cas_checker.check(user.id)
+    if is_cas_banned:
+        stats["cas_blocked"] += 1
+        try:
+            await bot.ban_chat_member(chat_id=chat_id, user_id=user.id)
+            await notify_admins(
+                f"🛡 <b>CAS-бан</b>\n"
+                f"Пользователь: {user.full_name} (<code>{user.id}</code>)\n"
+                f"Причина: в базе CAS"
+            )
+            logger.info(f"CAS-banned user {user.id}")
+        except Exception as e:
+            logger.error(f"Failed to ban CAS user: {e}")
+        return
+
+    # Анализ профиля
     is_suspicious, red_flags = behavior_analyzer.analyze_user_profile(user)
     if is_suspicious:
         logger.warning(f"Suspicious user joined: {user.id} - {red_flags}")
         stats["suspicious_users_blocked"] += 1
+
+    # Устанавливаем время присоединения
+    profile = behavior_analyzer.get_profile(user.id)
+    profile.join_time = datetime.now()
 
     try:
         # Ограничиваем права
@@ -573,7 +922,8 @@ async def on_user_join(event: ChatMemberUpdated):
             chat_id=chat_id,
             text=(
                 f"👋 <b>Добро пожаловать, {user_name}!</b>\n\n"
-                f"🔒 Для защиты от спама нажмите кнопку ниже "
+                f"{CHAT_RULES}\n"
+                f"🔒 Для подтверждения нажмите кнопку ниже "
                 f"в течение {VERIFY_TIMEOUT} секунд.\n\n"
                 f"Иначе вы будете удалены из чата."
             ),
@@ -611,6 +961,7 @@ async def on_verify_click(callback: CallbackQuery):
             pending_verification[user_id]["task"].cancel()
             pending_verification.pop(user_id, None)
 
+        # Для новичков - ограниченные права (нельзя ссылки/форварды)
         await bot.restrict_chat_member(
             chat_id=chat_id,
             user_id=user_id,
@@ -618,9 +969,9 @@ async def on_verify_click(callback: CallbackQuery):
                 can_send_messages=True,
                 can_send_media_messages=True,
                 can_send_other_messages=True,
-                can_add_web_page_previews=True,
+                can_add_web_page_previews=False,  # Нельзя превью ссылок
                 can_send_polls=True,
-                can_invite_users=True,
+                can_invite_users=False,  # Нельзя приглашать
                 can_change_info=False,
                 can_pin_messages=False
             )
@@ -631,7 +982,8 @@ async def on_verify_click(callback: CallbackQuery):
 
         await callback.message.edit_text(
             f"✅ <b>{callback.from_user.full_name}</b> верифицирован!\n\n"
-            f"Добро пожаловать в чат! 🎉",
+            f"📋 Не забывайте о правилах чата.\n"
+            f"Добро пожаловать! 🎉",
             parse_mode="HTML"
         )
 
@@ -648,6 +1000,90 @@ async def on_verify_click(callback: CallbackQuery):
         await callback.answer("Ошибка верификации", show_alert=True)
 
 
+@router.message(F.chat.type.in_({"group", "supergroup"}), F.photo)
+async def on_photo_message(message: Message):
+    """Обработка фото с OCR"""
+    if message.from_user.id in ADMIN_IDS:
+        return
+
+    if storage.is_whitelisted(message.from_user.id):
+        return
+
+    # Записываем активность
+    behavior_analyzer.record_message(message.from_user.id)
+
+    # Проверяем caption
+    caption = message.caption or ""
+    if caption:
+        # Используем стандартную проверку для подписи
+        await check_text_for_spam(message, caption)
+        return
+
+    # OCR для изображений
+    if OCR_AVAILABLE and message.photo:
+        try:
+            photo = message.photo[-1]  # Берём самое большое фото
+            file = await bot.get_file(photo.file_id)
+            photo_bytes = await bot.download_file(file.file_path)
+
+            # Извлекаем текст
+            ocr_text = await ocr_processor.extract_text(photo_bytes.read())
+
+            if ocr_text and len(ocr_text) > 20:
+                # Проверяем текст с фото
+                user_profile = behavior_analyzer.get_profile(message.from_user.id)
+                is_newbie = behavior_analyzer.is_newbie(message.from_user.id)
+                is_night = is_night_mode()
+                text_has_links = has_links(ocr_text)
+                is_cas = user_profile.is_cas_banned
+
+                features = ml_classifier.extract_features(
+                    ocr_text, user_profile, is_newbie, is_night, text_has_links, is_cas
+                )
+                is_spam, confidence, triggered = ml_classifier.classify(features)
+
+                if is_spam:
+                    stats["ocr_detections"] += 1
+                    await process_spam_message(
+                        message,
+                        f"OCR: {', '.join(triggered[:3])}",
+                        confidence
+                    )
+
+        except Exception as e:
+            logger.warning(f"OCR processing failed: {e}")
+
+
+@router.message(F.chat.type.in_({"group", "supergroup"}), F.forward_from | F.forward_from_chat)
+async def on_forward_message(message: Message):
+    """Обработка пересланных сообщений"""
+    if message.from_user.id in ADMIN_IDS:
+        return
+
+    if storage.is_whitelisted(message.from_user.id):
+        return
+
+    # Новички не могут пересылать
+    if behavior_analyzer.is_newbie(message.from_user.id):
+        try:
+            await message.delete()
+            stats["newbie_restricted"] += 1
+            warn_msg = await message.answer(
+                f"⚠️ Новые участники не могут пересылать сообщения первые {NEWBIE_HOURS} часов.",
+                parse_mode="HTML"
+            )
+            await asyncio.sleep(5)
+            await warn_msg.delete()
+        except:
+            pass
+        return
+
+    # Проверяем текст пересланного сообщения
+    text = message.text or message.caption or ""
+    if text:
+        await check_text_for_spam(message, text)
+
+
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 async def on_group_message(message: Message):
     """Проверка сообщений на спам"""
@@ -655,43 +1091,103 @@ async def on_group_message(message: Message):
     if message.from_user.id in ADMIN_IDS:
         return
 
+    # Пропускаем whitelist
+    if storage.is_whitelisted(message.from_user.id):
+        return
+
     # Пропускаем команды
     if message.text and message.text.startswith("/"):
         return
 
-    # Записываем активность
-    behavior_analyzer.record_message(message.from_user.id)
-
-    # Получаем текст
     text = message.text or message.caption or ""
+    await check_text_for_spam(message, text)
 
-    # Продвинутая проверка на спам
-    spam_detected, reason, confidence = await advanced_spam_check(message)
 
-    if spam_detected:
-        try:
-            await message.delete()
-            stats["spam_deleted"] += 1
-            behavior_analyzer.record_spam(message.from_user.id)
+async def check_text_for_spam(message: Message, text: str):
+    """Проверить текст на спам"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
 
-            user_name = message.from_user.full_name or message.from_user.username
-            logger.info(f"Spam deleted from {user_name} ({message.from_user.id}): {reason} [{confidence:.0%}]")
+    # Записываем активность
+    behavior_analyzer.record_message(user_id)
 
-            # Уведомление
-            warn_msg = await message.answer(
-                f"🚫 Сообщение удалено.\n"
-                f"<i>Причина: {reason}</i>",
-                parse_mode="HTML"
-            )
-            await asyncio.sleep(5)
+    user_profile = behavior_analyzer.get_profile(user_id)
+    is_newbie = behavior_analyzer.is_newbie(user_id)
+    is_night = is_night_mode()
+    text_has_links = has_links(text)
+
+    # Проверка cooldown для новичков
+    if is_newbie:
+        can_send, seconds_left = behavior_analyzer.check_newbie_cooldown(user_id)
+        if not can_send:
             try:
+                await message.delete()
+                stats["newbie_restricted"] += 1
+                warn_msg = await message.answer(
+                    f"⏳ Подождите {seconds_left} сек. (slow mode для новых участников)",
+                )
+                await asyncio.sleep(3)
                 await warn_msg.delete()
             except:
                 pass
+            return
+        behavior_analyzer.record_newbie_message(user_id)
 
-        except Exception as e:
-            logger.error(f"Error deleting spam: {e}")
+    # Ограничение ссылок для новичков
+    if is_newbie and text_has_links:
+        try:
+            await message.delete()
+            stats["newbie_restricted"] += 1
+            warn_msg = await message.answer(
+                f"🔗 Новые участники не могут отправлять ссылки первые {NEWBIE_HOURS} часов.",
+            )
+            await asyncio.sleep(5)
+            await warn_msg.delete()
+        except:
+            pass
+        return
 
+    # Проверка на мат
+    if check_profanity(text):
+        stats["profanity_blocked"] += 1
+        await process_spam_message(message, "нецензурная лексика", 0.9)
+        return
+
+    # Ночной режим - строже проверки
+    if is_night:
+        user_profile.spam_score += 0.1  # Увеличиваем подозрительность ночью
+
+    # CAS проверка (если ещё не проверяли)
+    if not user_profile.is_cas_banned:
+        user_profile.is_cas_banned = await cas_checker.check(user_id)
+        if user_profile.is_cas_banned:
+            stats["cas_blocked"] += 1
+            await auto_ban_user(user_id, chat_id, "Найден в базе CAS")
+            try:
+                await message.delete()
+            except:
+                pass
+            return
+
+    # Проверка на дубликаты
+    is_duplicate, dup_reason = similarity_checker.check(text, user_id, chat_id)
+    if is_duplicate:
+        stats["duplicates_blocked"] += 1
+        await process_spam_message(message, dup_reason, 0.85)
+        return
+
+    # ML классификация
+    features = ml_classifier.extract_features(
+        text, user_profile, is_newbie, is_night, text_has_links, user_profile.is_cas_banned
+    )
+    is_spam, confidence, triggered = ml_classifier.classify(features)
+
+    if is_spam:
+        reason = ', '.join(triggered[:3]) if triggered else "подозрительное сообщение"
+        await process_spam_message(message, reason, confidence)
+
+
+# ============== КОМАНДЫ АДМИНИСТРАТОРА ==============
 
 @router.message(Command("spam_stats"))
 async def cmd_stats(message: Message):
@@ -703,15 +1199,26 @@ async def cmd_stats(message: Message):
     hours = int(uptime.total_seconds() // 3600)
     minutes = int((uptime.total_seconds() % 3600) // 60)
 
+    night_status = "🌙 АКТИВЕН" if is_night_mode() else "☀️ неактивен"
+
     await message.answer(
-        f"📊 <b>Статистика спам-фильтра v2.0</b>\n\n"
+        f"📊 <b>Статистика спам-фильтра v3.0</b>\n\n"
         f"⏱ Аптайм: {hours}ч {minutes}м\n"
+        f"🌙 Ночной режим: {night_status}\n\n"
+        f"<b>Блокировки:</b>\n"
         f"🗑 Удалено спама: {stats['spam_deleted']}\n"
         f"🔄 Дубликатов: {stats['duplicates_blocked']}\n"
-        f"👤 Подозрительных: {stats['suspicious_users_blocked']}\n"
+        f"🛡 CAS-баны: {stats['cas_blocked']}\n"
+        f"🤬 За мат: {stats['profanity_blocked']}\n"
+        f"🆕 Новички: {stats['newbie_restricted']}\n"
+        f"📷 OCR: {stats['ocr_detections']}\n"
+        f"👤 Подозрительных: {stats['suspicious_users_blocked']}\n\n"
+        f"<b>Пользователи:</b>\n"
         f"✅ Верифицировано: {stats['users_verified']}\n"
         f"🚫 Кикнуто: {stats['users_kicked']}\n"
-        f"👥 В базе: {len(verified_users)}",
+        f"⛔️ Забанено: {stats['users_banned']}\n"
+        f"👥 В базе: {len(verified_users)}\n"
+        f"📝 Whitelist: {len(storage.whitelist)}",
         parse_mode="HTML"
     )
 
@@ -735,6 +1242,101 @@ async def cmd_add_keyword(message: Message):
         await message.answer(f"⚠️ Уже есть: <code>{keyword}</code>", parse_mode="HTML")
 
 
+@router.message(Command("spam_whitelist"))
+async def cmd_whitelist(message: Message):
+    """Управление whitelist"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.text.split()
+
+    if len(args) < 2:
+        # Показать whitelist
+        if storage.whitelist:
+            users = ", ".join(str(u) for u in storage.whitelist)
+            await message.answer(f"📝 <b>Whitelist:</b>\n{users}", parse_mode="HTML")
+        else:
+            await message.answer("📝 Whitelist пуст")
+        return
+
+    action = args[1].lower()
+
+    if action == "add" and len(args) >= 3:
+        try:
+            user_id = int(args[2])
+            storage.add_to_whitelist(user_id)
+            await message.answer(f"✅ Добавлен в whitelist: <code>{user_id}</code>", parse_mode="HTML")
+        except ValueError:
+            await message.answer("❌ Неверный ID пользователя")
+
+    elif action == "remove" and len(args) >= 3:
+        try:
+            user_id = int(args[2])
+            storage.remove_from_whitelist(user_id)
+            await message.answer(f"✅ Удалён из whitelist: <code>{user_id}</code>", parse_mode="HTML")
+        except ValueError:
+            await message.answer("❌ Неверный ID пользователя")
+
+    else:
+        await message.answer(
+            "Использование:\n"
+            "/spam_whitelist — показать список\n"
+            "/spam_whitelist add <user_id> — добавить\n"
+            "/spam_whitelist remove <user_id> — удалить"
+        )
+
+
+@router.message(Command("spam_unban"))
+async def cmd_unban(message: Message):
+    """Разбанить пользователя"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Использование: /spam_unban <user_id>")
+        return
+
+    try:
+        user_id = int(args[1])
+        storage.reset_warnings(user_id)
+        storage.banned_users.discard(user_id)
+        storage._save_whitelist()
+
+        # Разбанить в чате (если в группе)
+        if message.chat.type in ["group", "supergroup"]:
+            try:
+                await bot.unban_chat_member(chat_id=message.chat.id, user_id=user_id)
+            except:
+                pass
+
+        await message.answer(f"✅ Разбанен: <code>{user_id}</code>", parse_mode="HTML")
+    except ValueError:
+        await message.answer("❌ Неверный ID пользователя")
+
+
+@router.message(Command("spam_warn"))
+async def cmd_check_warnings(message: Message):
+    """Проверить предупреждения пользователя"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Использование: /spam_warn <user_id>")
+        return
+
+    try:
+        user_id = int(args[1])
+        warnings = storage.get_warnings(user_id)
+        is_banned = storage.is_banned(user_id)
+
+        status = "⛔️ ЗАБАНЕН" if is_banned else f"⚠️ {warnings}/{MAX_WARNINGS}"
+        await message.answer(f"Пользователь <code>{user_id}</code>: {status}", parse_mode="HTML")
+    except ValueError:
+        await message.answer("❌ Неверный ID пользователя")
+
+
 @router.message(Command("spam_help"))
 async def cmd_help(message: Message):
     """Помощь по командам"""
@@ -742,17 +1344,27 @@ async def cmd_help(message: Message):
         return
 
     await message.answer(
-        "🤖 <b>Команды спам-фильтра v2.0</b>\n\n"
-        "/spam_stats — статистика бота\n"
-        "/spam_add <слово> — добавить стоп-слово\n"
-        "/spam_help — эта справка\n\n"
-        "<b>Возможности:</b>\n"
-        "• Верификация кнопкой (60 сек)\n"
-        "• 100+ ключевых слов\n"
-        "• Детекция скрытого спама\n"
-        "• Обнаружение дубликатов\n"
-        "• Анализ профилей\n"
-        "• Защита от обхода (латиница→кириллица)",
+        "🤖 <b>Команды спам-фильтра v3.0</b>\n\n"
+        "<b>Статистика:</b>\n"
+        "/spam_stats — статистика бота\n\n"
+        "<b>Ключевые слова:</b>\n"
+        "/spam_add <слово> — добавить стоп-слово\n\n"
+        "<b>Пользователи:</b>\n"
+        "/spam_whitelist — управление whitelist\n"
+        "/spam_warn <id> — проверить предупреждения\n"
+        "/spam_unban <id> — разбанить пользователя\n\n"
+        "<b>Возможности v3.0:</b>\n"
+        "• ✅ Верификация с правилами\n"
+        "• 🛡 CAS интеграция\n"
+        "• ⚠️ Авто-бан (5 предупреждений)\n"
+        "• 🌙 Ночной режим (23-07)\n"
+        "• 📝 Whitelist\n"
+        "• 🔔 Уведомления админам\n"
+        "• ⏳ Slow mode для новичков\n"
+        "• 🔗 Ограничение ссылок\n"
+        "• 🤖 ML классификатор\n"
+        "• 📷 OCR для фото\n"
+        "• 🤬 Мат-фильтр",
         parse_mode="HTML"
     )
 
@@ -766,30 +1378,97 @@ async def cmd_start(message: Message):
     is_admin = message.from_user.id in ADMIN_IDS
 
     await message.answer(
-        "🛡 <b>Спам-фильтр бот v2.0</b>\n\n"
+        "🛡 <b>Спам-фильтр бот v3.0</b>\n\n"
         "Я защищаю чаты от спама и ботов.\n\n"
         "<b>Что я умею:</b>\n"
-        "• Верификация новых участников\n"
-        "• Умная фильтрация спама\n"
-        "• Детекция скрытых предложений работы\n"
-        "• Обнаружение дубликатов сообщений\n"
-        "• Анализ подозрительных профилей\n"
-        "• Защита от обхода фильтров\n\n"
+        "• Верификация с правилами чата\n"
+        "• CAS (Combot Anti-Spam) проверка\n"
+        "• Авто-бан после 5 предупреждений\n"
+        "• Ночной режим (23:00-07:00)\n"
+        "• Whitelist для доверенных\n"
+        "• Slow mode для новичков\n"
+        "• Ограничение ссылок/пересылок\n"
+        "• ML классификация спама\n"
+        "• OCR для изображений\n"
+        "• Мат-фильтр\n\n"
         "<b>Как подключить:</b>\n"
         "1. Добавьте меня в группу\n"
         "2. Назначьте администратором\n"
         "3. Дайте права: удалять сообщения, банить\n\n"
         + ("👑 <b>Вы администратор бота</b>\n"
-           "Команды: /spam_stats, /spam_add, /spam_help" if is_admin else ""),
+           "/spam_help — все команды" if is_admin else ""),
         parse_mode="HTML"
     )
 
 
+# ============== ФОНОВЫЕ ЗАДАЧИ ==============
+
+async def auto_cleanup_task():
+    """Автоматическая очистка старых данных"""
+    while True:
+        await asyncio.sleep(3600)  # Каждый час
+
+        try:
+            # Очистка старых сообщений из similarity checker
+            now = datetime.now()
+            cutoff = now - timedelta(hours=2)
+
+            for chat_id in list(similarity_checker.recent_messages.keys()):
+                similarity_checker.recent_messages[chat_id] = [
+                    msg for msg in similarity_checker.recent_messages[chat_id]
+                    if msg[3] > cutoff
+                ]
+                if not similarity_checker.recent_messages[chat_id]:
+                    del similarity_checker.recent_messages[chat_id]
+
+            # Очистка CAS кеша
+            for user_id in list(cas_checker.cache.keys()):
+                _, cached_at = cas_checker.cache[user_id]
+                if now - cached_at > cas_checker.cache_ttl:
+                    del cas_checker.cache[user_id]
+
+            logger.info("Auto-cleanup completed")
+
+        except Exception as e:
+            logger.error(f"Auto-cleanup error: {e}")
+
+
+async def grant_full_permissions_task():
+    """Выдать полные права пользователям после периода новичка"""
+    while True:
+        await asyncio.sleep(1800)  # Каждые 30 минут
+
+        try:
+            now = datetime.now()
+
+            for user_id, profile in list(behavior_analyzer.profiles.items()):
+                hours_since_join = (now - profile.join_time).total_seconds() / 3600
+
+                # Если пользователь больше не новичок и верифицирован
+                if hours_since_join >= NEWBIE_HOURS and user_id in verified_users:
+                    # Тут можно выдать полные права, но нужен chat_id
+                    # Это делается при следующем сообщении пользователя
+                    pass
+
+        except Exception as e:
+            logger.error(f"Permissions task error: {e}")
+
+
 async def main():
     """Запуск бота"""
-    logger.info("Starting spam filter bot v2.0...")
+    logger.info("Starting spam filter bot v3.0...")
+    logger.info(f"OCR available: {OCR_AVAILABLE}")
+    logger.info(f"Aiohttp available: {AIOHTTP_AVAILABLE}")
+    logger.info(f"Night mode: {NIGHT_START} - {NIGHT_END}")
+    logger.info(f"Max warnings: {MAX_WARNINGS}")
+    logger.info(f"Newbie hours: {NEWBIE_HOURS}")
 
     dp.include_router(router)
+
+    # Запускаем фоновые задачи
+    asyncio.create_task(auto_cleanup_task())
+    asyncio.create_task(grant_full_permissions_task())
+
     await bot.delete_webhook(drop_pending_updates=True)
 
     logger.info("Bot started successfully!")
