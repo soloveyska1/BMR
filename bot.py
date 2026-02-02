@@ -2,7 +2,7 @@ import asyncio
 import logging
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -42,6 +42,21 @@ from database import (
     export_messages,
     get_user_history,
     get_user_stats,
+    # Слушатели
+    get_or_create_listener,
+    update_listener_activity,
+    get_listener_profile,
+    LISTENER_LEVELS,
+    get_level_info,
+    # Эфир
+    add_to_on_air_queue,
+    get_on_air_queue,
+    remove_from_on_air_queue,
+    mark_as_read_on_air,
+    # Статистика
+    get_pending_messages_count,
+    get_daily_digest,
+    get_top_listeners,
 )
 
 # Логирование
@@ -974,6 +989,20 @@ def format_message_card(msg, show_text: bool = True) -> str:
 
 # ============ КОМАНДЫ ============
 
+def get_user_welcome_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура приветствия для слушателей"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎵 Заказать песню", callback_data="action:song_request"),
+            InlineKeyboardButton(text="💬 Написать", callback_data="action:write_message"),
+        ],
+        [
+            InlineKeyboardButton(text="👋 Передать привет", callback_data="action:send_greeting"),
+            InlineKeyboardButton(text="📻 Мой профиль", callback_data="action:my_profile"),
+        ],
+    ])
+
+
 @dp.message(Command("start", "menu"))
 async def cmd_start(message: Message, state: FSMContext):
     """Главное меню"""
@@ -981,32 +1010,45 @@ async def cmd_start(message: Message, state: FSMContext):
 
     if is_admin(message.from_user.id):
         stats = await get_stats()
+        pending = await get_pending_messages_count(hours=2)
 
         text = (
             f"👋 <b>Панель управления</b>\n\n"
             f"📨 Всего сообщений: <b>{stats['total']}</b>\n"
             f"🆕 Непрочитанных: <b>{stats['unread']}</b>\n"
             f"⭐ Избранных: <b>{stats['starred']}</b>\n"
-            f"👥 Пользователей: <b>{stats['unique_users']}</b>\n"
+            f"👥 Слушателей: <b>{stats['unique_users']}</b>\n"
             f"📅 Сегодня: <b>{stats['today']}</b>\n"
         )
+        if pending > 0:
+            text += f"\n⚠️ <b>Ждут ответа >2ч:</b> {pending}"
 
-        # Показываем кнопки внизу экрана + inline меню
         await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_admin_reply_keyboard())
     else:
-        await message.answer(
-            "👋 <b>Привет!</b>\n\n"
-            "Напиши мне своё сообщение, и оно будет передано автору.\n\n"
-            "📝 Можешь отправить:\n"
-            "• Текст\n"
-            "• Фото\n"
-            "• Голосовое\n"
-            "• Видео\n"
-            "• Документ\n\n"
-            "✨ <i>Каждое сообщение важно!</i>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=ReplyKeyboardRemove()
-        )
+        user = message.from_user
+        listener = await get_or_create_listener(user.id, user.username, user.full_name)
+        level_info = get_level_info(listener.get("level", 1))
+        first_name = user.first_name or "друг"
+
+        if listener.get("total_messages", 0) == 0:
+            text = (
+                f"🎵 <b>Привет, {first_name}!</b>\n\n"
+                f"Добро пожаловать на волну <b>БИМ радио</b>! 📻\n\n"
+                f"Здесь ты можешь:\n"
+                f"• 🎵 Заказать любимую песню\n"
+                f"• 💬 Написать ведущим\n"
+                f"• 👋 Передать привет\n\n"
+                f"<i>Твоё сообщение может прозвучать в эфире!</i> 🎤"
+            )
+        else:
+            text = (
+                f"🎵 <b>С возвращением, {first_name}!</b>\n\n"
+                f"{level_info['name']}\n"
+                f"📨 Сообщений: {listener.get('total_messages', 0)}\n\n"
+                f"<i>Рады снова тебя слышать!</i> 📻"
+            )
+
+        await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_user_welcome_keyboard())
 
 
 # ============ ОБРАБОТЧИКИ КНОПОК АДМИНА ============
@@ -1720,6 +1762,97 @@ async def callback_cancel_reply(callback: CallbackQuery, state: FSMContext):
     await callback.answer("Отменено")
 
 
+# ============ CALLBACK: ДЕЙСТВИЯ СЛУШАТЕЛЕЙ ============
+
+@dp.callback_query(F.data == "action:my_profile")
+async def callback_user_profile(callback: CallbackQuery):
+    """Профиль слушателя"""
+    user = callback.from_user
+    profile = await get_listener_profile(user.id)
+    if not profile:
+        profile = await get_or_create_listener(user.id, user.username, user.full_name)
+
+    level_info = get_level_info(profile.get("level", 1))
+    current_level = profile.get("level", 1)
+    current_messages = profile.get("total_messages", 0)
+
+    progress_text = ""
+    if current_level < 5:
+        next_level_info = get_level_info(current_level + 1)
+        needed = next_level_info["min_messages"] - current_messages
+        progress_text = f"\n\n📈 До {next_level_info['name']}: ещё {needed} сообщ."
+
+    text = (
+        f"📻 <b>Твой профиль</b>\n\n"
+        f"{level_info['name']}\n"
+        f"📨 Сообщений: {current_messages}\n"
+        f"📻 Прочитано в эфире: {profile.get('on_air_count', 0)}\n"
+        f"💬 Получено ответов: {profile.get('replies_received', 0)}"
+        f"{progress_text}"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="action:back_menu")],
+    ])
+    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "action:back_menu")
+async def callback_back_to_menu(callback: CallbackQuery):
+    """Назад в меню"""
+    user = callback.from_user
+    listener = await get_or_create_listener(user.id, user.username, user.full_name)
+    level_info = get_level_info(listener.get("level", 1))
+    first_name = user.first_name or "друг"
+
+    text = (
+        f"🎵 <b>Привет, {first_name}!</b>\n\n"
+        f"{level_info['name']}\n"
+        f"📨 Сообщений: {listener.get('total_messages', 0)}\n\n"
+        f"<i>Что хочешь сделать?</i> 📻"
+    )
+    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=get_user_welcome_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("action:"))
+async def callback_user_actions(callback: CallbackQuery):
+    """Действия слушателей"""
+    action = callback.data.split(":")[1]
+
+    if action == "song_request":
+        text = (
+            "🎵 <b>Заказ песни</b>\n\n"
+            "Напиши название песни и исполнителя!\n\n"
+            "<i>Пример: Земфира - Искала</i>"
+        )
+    elif action == "write_message":
+        text = (
+            "💬 <b>Напиши нам!</b>\n\n"
+            "Можешь отправить:\n"
+            "• 📝 Текст\n"
+            "• 📷 Фото\n"
+            "• 🎤 Голосовое\n\n"
+            "<i>Твоё сообщение могут прочитать в эфире!</i>"
+        )
+    elif action == "send_greeting":
+        text = (
+            "👋 <b>Передать привет</b>\n\n"
+            "Напиши кому хочешь передать привет!\n\n"
+            "<i>Может прозвучать в эфире 📻</i>"
+        )
+    else:
+        await callback.answer()
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="action:back_menu")]
+    ])
+    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    await callback.answer()
+
+
 # ============ ОБРАБОТКА СООБЩЕНИЙ ============
 
 @dp.message(ReplyState.waiting_for_search)
@@ -1888,8 +2021,17 @@ async def handle_user_message(message: Message, state: FSMContext):
         # Push-уведомления админам
         await notify_admins_new_message(msg_id, full_name, text_content, priority)
 
-        await message.answer(AUTO_REPLY_TEXT)
-        logger.info(f"#{msg_id} от {full_name} [{priority}]")
+        # Обновляем активность слушателя
+        activity = await update_listener_activity(user.id, username, full_name)
+
+        # Ответ с учётом повышения уровня
+        response = AUTO_REPLY_TEXT
+        if activity.get("level_up"):
+            new_level_info = get_level_info(activity["new_level"])
+            response += f"\n\n🎉 <b>Поздравляем!</b> Ты достиг уровня {new_level_info['name']}!"
+
+        await message.answer(response, parse_mode=ParseMode.HTML)
+        logger.info(f"#{msg_id} от {full_name} [{priority}] lvl={activity.get('new_level')}")
 
     except Exception as e:
         logger.error(f"Ошибка: {e}")

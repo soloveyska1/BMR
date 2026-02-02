@@ -1,6 +1,31 @@
 import aiosqlite
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Optional
 from config import DATABASE_PATH
+
+
+# ============== УРОВНИ СЛУШАТЕЛЕЙ ==============
+LISTENER_LEVELS = {
+    1: {"name": "🆕 Новичок", "min_messages": 0},
+    2: {"name": "🔄 Постоянный", "min_messages": 3},
+    3: {"name": "⭐ Активист", "min_messages": 10},
+    4: {"name": "💎 VIP", "min_messages": 25},
+    5: {"name": "👑 Легенда", "min_messages": 50},
+}
+
+
+def get_level_for_messages(message_count: int) -> int:
+    """Определить уровень по количеству сообщений"""
+    level = 1
+    for lvl, data in LISTENER_LEVELS.items():
+        if message_count >= data["min_messages"]:
+            level = lvl
+    return level
+
+
+def get_level_info(level: int) -> dict:
+    """Получить информацию об уровне"""
+    return LISTENER_LEVELS.get(level, LISTENER_LEVELS[1])
 
 
 async def init_db():
@@ -24,9 +49,39 @@ async def init_db():
                 category TEXT DEFAULT NULL,
                 reply_text TEXT DEFAULT NULL,
                 replied_at TIMESTAMP DEFAULT NULL,
+                read_on_air INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Таблица слушателей
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS listeners (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                level INTEGER DEFAULT 1,
+                total_messages INTEGER DEFAULT 0,
+                first_message_at TIMESTAMP,
+                last_message_at TIMESTAMP,
+                on_air_count INTEGER DEFAULT 0,
+                replies_received INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Очередь для эфира
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS on_air_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER,
+                user_id INTEGER,
+                priority INTEGER DEFAULT 0,
+                shoutout_type TEXT DEFAULT NULL,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         await db.commit()
 
 
@@ -337,3 +392,155 @@ async def get_user_stats(user_id: int):
             "first_message": first_message,
             "replied": replied
         }
+
+
+# ============== ФУНКЦИИ ДЛЯ СЛУШАТЕЛЕЙ ==============
+
+async def get_or_create_listener(user_id: int, username: str = None, full_name: str = None) -> dict:
+    """Получить или создать профиль слушателя"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM listeners WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+
+        if row:
+            if username or full_name:
+                await db.execute(
+                    "UPDATE listeners SET username = COALESCE(?, username), full_name = COALESCE(?, full_name) WHERE user_id = ?",
+                    (username, full_name, user_id)
+                )
+                await db.commit()
+            return dict(row)
+
+        now = datetime.now().isoformat()
+        await db.execute(
+            "INSERT INTO listeners (user_id, username, full_name, first_message_at, last_message_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, full_name, now, now)
+        )
+        await db.commit()
+
+        cursor = await db.execute("SELECT * FROM listeners WHERE user_id = ?", (user_id,))
+        return dict(await cursor.fetchone())
+
+
+async def update_listener_activity(user_id: int, username: str = None, full_name: str = None) -> dict:
+    """Обновить активность слушателя"""
+    listener = await get_or_create_listener(user_id, username, full_name)
+    now = datetime.now()
+
+    new_total = listener["total_messages"] + 1
+    new_level = get_level_for_messages(new_total)
+    old_level = listener.get("level", 1)
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE listeners SET total_messages = ?, level = ?, last_message_at = ? WHERE user_id = ?",
+            (new_total, new_level, now.isoformat(), user_id)
+        )
+        await db.commit()
+
+    return {
+        "level_up": new_level > old_level,
+        "new_level": new_level,
+        "total_messages": new_total
+    }
+
+
+async def get_listener_profile(user_id: int) -> Optional[dict]:
+    """Получить профиль слушателя"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM listeners WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if row:
+            profile = dict(row)
+            profile["level_info"] = get_level_info(profile.get("level", 1))
+            return profile
+        return None
+
+
+# ============== ОЧЕРЕДЬ ДЛЯ ЭФИРА ==============
+
+async def add_to_on_air_queue(message_id: int, user_id: int, shoutout_type: str = None) -> int:
+    """Добавить в очередь для эфира"""
+    listener = await get_listener_profile(user_id)
+    priority = listener.get("level", 1) if listener else 1
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO on_air_queue (message_id, user_id, priority, shoutout_type) VALUES (?, ?, ?, ?)",
+            (message_id, user_id, priority, shoutout_type)
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_on_air_queue(limit: int = 10) -> list:
+    """Получить очередь для эфира"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT q.*, m.text, m.full_name, m.username, l.level
+            FROM on_air_queue q
+            JOIN messages m ON q.message_id = m.id
+            LEFT JOIN listeners l ON q.user_id = l.user_id
+            ORDER BY q.priority DESC, q.added_at ASC
+            LIMIT ?
+            """,
+            (limit,)
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+
+async def remove_from_on_air_queue(queue_id: int):
+    """Удалить из очереди"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("DELETE FROM on_air_queue WHERE id = ?", (queue_id,))
+        await db.commit()
+
+
+async def mark_as_read_on_air(message_id: int, user_id: int):
+    """Отметить как прочитанное в эфире"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("UPDATE messages SET read_on_air = 1 WHERE id = ?", (message_id,))
+        await db.execute("UPDATE listeners SET on_air_count = on_air_count + 1 WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+
+# ============== СТАТИСТИКА ДЛЯ АДМИНОВ ==============
+
+async def get_pending_messages_count(hours: int = 2) -> int:
+    """Сообщения без ответа старше N часов"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM messages WHERE reply_text IS NULL AND is_hidden = 0 AND created_at < datetime('now', '-' || ? || ' hours')",
+            (hours,)
+        )
+        return (await cursor.fetchone())[0]
+
+
+async def get_daily_digest() -> dict:
+    """Данные для ежедневного дайджеста"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM messages WHERE date(created_at) = date('now', '-1 day') AND is_hidden = 0")
+        yesterday = (await cursor.fetchone())[0]
+
+        cursor = await db.execute("SELECT COUNT(*) FROM messages WHERE is_read = 0 AND is_hidden = 0")
+        unread = (await cursor.fetchone())[0]
+
+        cursor = await db.execute("SELECT COUNT(*) FROM messages WHERE reply_text IS NULL AND is_hidden = 0 AND created_at < datetime('now', '-2 hours')")
+        pending = (await cursor.fetchone())[0]
+
+        cursor = await db.execute("SELECT COUNT(*) FROM listeners WHERE date(created_at) = date('now', '-1 day')")
+        new_listeners = (await cursor.fetchone())[0]
+
+        return {"yesterday": yesterday, "unread": unread, "pending": pending, "new_listeners": new_listeners}
+
+
+async def get_top_listeners(limit: int = 5) -> list:
+    """Топ слушателей"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM listeners ORDER BY total_messages DESC LIMIT ?", (limit,))
+        return [dict(row) for row in await cursor.fetchall()]
