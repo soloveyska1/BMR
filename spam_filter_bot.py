@@ -62,8 +62,8 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("SPAM_ADMIN_IDS", "").split(",") 
 TESTER_IDS = [8420766371]
 
 # Версия и время деплоя (обновляется автоматически)
-BOT_VERSION = "3.1"
-DEPLOY_TIME = "2026-02-02 04:45 MSK"
+BOT_VERSION = "3.2"
+DEPLOY_TIME = "2026-02-02 05:02 MSK"
 
 # Время на верификацию (секунды)
 VERIFY_TIMEOUT = 60
