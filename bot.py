@@ -27,7 +27,7 @@ from aiogram.fsm.state import State, StatesGroup
 from config import BOT_TOKEN, CHANNEL_ID, ADMIN_IDS, AUTO_REPLY_TEXT
 
 # Версия бота и время запуска
-VERSION = "3.3"
+VERSION = "3.4"
 BOT_START_TIME = datetime.now()
 from database import (
     init_db,
@@ -1160,18 +1160,23 @@ async def cmd_cancel(message: Message, state: FSMContext):
 @dp.message(Command("ping"))
 async def cmd_ping(message: Message):
     """Проверка здоровья бота"""
-    if not is_admin(message.from_user.id):
-        return
-
-    stats = await get_stats()
-    text = (
-        f"🏓 <b>Pong!</b>\n\n"
-        f"📻 БИМ Радио бот <code>v{VERSION}</code>\n"
-        f"⏱ Uptime: <b>{format_uptime()}</b>\n"
-        f"📨 Сообщений: <b>{stats['total']}</b>\n"
-        f"🆕 Непрочитанных: <b>{stats['unread']}</b>\n"
-        f"✅ Бот работает нормально!"
-    )
+    if is_admin(message.from_user.id):
+        stats = await get_stats()
+        text = (
+            f"🏓 <b>Pong!</b>\n\n"
+            f"📻 БИМ Радио бот <code>v{VERSION}</code>\n"
+            f"⏱ Uptime: <b>{format_uptime()}</b>\n"
+            f"📨 Сообщений: <b>{stats['total']}</b>\n"
+            f"🆕 Непрочитанных: <b>{stats['unread']}</b>\n"
+            f"✅ Бот работает нормально!"
+        )
+    else:
+        text = (
+            f"🏓 <b>Pong!</b>\n\n"
+            f"📻 БИМ Радио бот <code>v{VERSION}</code>\n"
+            f"⏱ Uptime: <b>{format_uptime()}</b>\n"
+            f"✅ Бот работает!"
+        )
     await message.answer(text, parse_mode=ParseMode.HTML)
 
 
