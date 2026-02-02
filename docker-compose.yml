@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  # Message Collector Bot
+  collector-bot:
+    build:
+      context: .
+      target: collector-bot
+    container_name: bmr-collector-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./messages.db:/app/messages.db
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Spam Filter Bot
+  spam-bot:
+    build:
+      context: .
+      target: spam-bot
+    container_name: bmr-spam-bot
+    restart: unless-stopped
+    env_file:
+      - spam_bot.env
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  data:

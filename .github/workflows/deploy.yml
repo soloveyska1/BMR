@@ -1,0 +1,61 @@
+name: Deploy BMR Bots
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies and test
+        run: |
+          pip install -r requirements.txt
+          python -m py_compile bot.py
+          python -m py_compile spam_filter_bot.py
+          python -m py_compile database.py
+          python -m py_compile config.py
+          echo "Syntax check passed!"
+
+      - name: Deploy to server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          script: |
+            cd ${{ secrets.PROJECT_PATH || '~/BMR' }}
+
+            # Pull latest changes
+            git fetch origin
+            git reset --hard origin/main || git reset --hard origin/master
+
+            # Install/update dependencies
+            pip install -r requirements.txt --quiet
+
+            # Restart services
+            sudo systemctl restart bmr-collector-bot || true
+            sudo systemctl restart bmr-spam-bot || true
+
+            echo "Deploy completed at $(date)"
+
+      - name: Notify on success
+        if: success()
+        run: echo "Deployment successful!"
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "Deployment failed!"

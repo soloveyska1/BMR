@@ -131,3 +131,126 @@ CMD ["python", "bot.py"]
 docker build -t message-bot .
 docker run -d --env-file .env message-bot
 ```
+
+## Автоматический деплой (CI/CD)
+
+Проект поддерживает автоматический деплой при каждом push в репозиторий.
+
+### Быстрая настройка (5 минут)
+
+#### 1. Настройка сервера (один раз)
+
+```bash
+# Скачать и запустить скрипт настройки
+curl -sSL https://raw.githubusercontent.com/soloveyska1/BMR/main/deploy/setup-server.sh | bash
+```
+
+Или вручную:
+```bash
+cd ~/BMR
+chmod +x deploy/setup-server.sh
+./deploy/setup-server.sh
+```
+
+#### 2. Настройка GitHub Secrets
+
+Перейди в **Settings > Secrets and variables > Actions** в репозитории и добавь:
+
+| Secret | Описание | Пример |
+|--------|----------|--------|
+| `SERVER_HOST` | IP адрес сервера | `123.45.67.89` |
+| `SERVER_USER` | Имя пользователя SSH | `ubuntu` |
+| `SSH_PRIVATE_KEY` | Приватный SSH ключ | `-----BEGIN OPENSSH...` |
+| `SERVER_PORT` | SSH порт (опционально) | `22` |
+| `PROJECT_PATH` | Путь к проекту (опционально) | `~/BMR` |
+
+#### 3. Генерация SSH ключа
+
+```bash
+# На своём компьютере
+ssh-keygen -t ed25519 -C "github-actions-deploy"
+
+# Скопировать публичный ключ на сервер
+ssh-copy-id -i ~/.ssh/id_ed25519.pub user@your-server
+
+# Содержимое приватного ключа добавить в GitHub Secret SSH_PRIVATE_KEY
+cat ~/.ssh/id_ed25519
+```
+
+### Как это работает
+
+1. Ты делаешь `git push` в ветку `main` или `master`
+2. GitHub Actions автоматически:
+   - Проверяет синтаксис Python
+   - Подключается к серверу по SSH
+   - Скачивает последние изменения
+   - Перезапускает ботов
+
+### Выбор метода деплоя
+
+**Вариант A: Systemd (рекомендуется для VPS)**
+- Используется workflow `deploy.yml`
+- Легче в настройке
+- Меньше ресурсов
+
+**Вариант B: Docker**
+- Используется workflow `deploy-docker.yml`
+- Изоляция окружения
+- Легче масштабировать
+
+Для Docker деплоя отключи `deploy.yml` и включи `deploy-docker.yml` в `.github/workflows/`.
+
+### Docker Compose
+
+Запуск обоих ботов одной командой:
+
+```bash
+# Создать .env и spam_bot.env файлы
+cp .env.example .env
+cp spam_bot.env.example spam_bot.env
+# Отредактировать с токенами
+
+# Запустить
+docker-compose up -d
+
+# Посмотреть логи
+docker-compose logs -f
+
+# Остановить
+docker-compose down
+```
+
+### Ручной деплой
+
+Если нужно задеплоить вручную:
+
+```bash
+cd ~/BMR
+./deploy/deploy.sh
+```
+
+### Просмотр логов
+
+```bash
+# Systemd
+journalctl -u bmr-collector-bot -f
+journalctl -u bmr-spam-bot -f
+
+# Docker
+docker-compose logs -f collector-bot
+docker-compose logs -f spam-bot
+```
+
+### Структура CI/CD
+
+```
+deploy/
+├── deploy.sh              # Скрипт деплоя
+├── setup-server.sh        # Первоначальная настройка сервера
+├── bmr-collector-bot.service  # Systemd unit (шаблон)
+└── bmr-spam-bot.service       # Systemd unit (шаблон)
+
+.github/workflows/
+├── deploy.yml             # GitHub Actions (Systemd)
+└── deploy-docker.yml      # GitHub Actions (Docker)
+```
