@@ -79,9 +79,8 @@ PROFILE_EXPIRE_DAYS = 30    # Удалять профили старше N дн�
 CAS_RATE_LIMIT = 30         # Максимум запросов в минуту
 CAS_RATE_WINDOW = 60        # Окно в секундах
 
-# Аудит логирование
+# Аудит логирование (AUDIT_LOG_FILE определяется после DATA_DIR)
 AUDIT_LOG_ENABLED = True
-AUDIT_LOG_FILE = DATA_DIR / "audit.log"
 MAX_AUDIT_SIZE_MB = 50      # Максимальный размер лог файла
 
 # Время на верификацию (секунды)
@@ -110,6 +109,7 @@ DATA_DIR = Path(__file__).parent / "spam_bot_data"
 DATA_DIR.mkdir(exist_ok=True)
 WHITELIST_FILE = DATA_DIR / "whitelist.json"
 WARNINGS_FILE = DATA_DIR / "warnings.json"
+AUDIT_LOG_FILE = DATA_DIR / "audit.log"
 
 # ============== ПРАВИЛА ЧАТА ==============
 CHAT_RULES = """
