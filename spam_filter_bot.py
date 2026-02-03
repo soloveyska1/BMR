@@ -62,8 +62,8 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("SPAM_ADMIN_IDS", "").split(",") 
 TESTER_IDS = [8420766371]
 
 # Версия и время деплоя (обновляется автоматически)
-BOT_VERSION = "3.6"
-DEPLOY_TIME = "2026-02-03 22:15 MSK"
+BOT_VERSION = "3.7"
+DEPLOY_TIME = "2026-02-03 22:30 MSK"
 
 # Время на верификацию (секунды)
 VERIFY_TIMEOUT = 60
@@ -1160,19 +1160,22 @@ async def process_spam_message(message: Message, reason: str, confidence: float)
     chat_id = message.chat.id
     user_name = message.from_user.full_name or message.from_user.username
 
-    # Тестер - УДАЛЯЕМ сообщение, но БЕЗ предупреждений и бана
-    if user_id in TESTER_IDS:
+    # Тестер или Админ - УДАЛЯЕМ сообщение, но БЕЗ предупреждений и бана
+    if user_id in TESTER_IDS or user_id in ADMIN_IDS:
+        role = "ADMIN" if user_id in ADMIN_IDS else "TESTER"
+        role_label = "админ" if user_id in ADMIN_IDS else "тестер"
+
         try:
             await message.delete()
             stats["spam_deleted"] += 1
         except Exception as e:
-            logger.warning(f"[TESTER] Failed to delete message: {e}")
+            logger.warning(f"[{role}] Failed to delete message: {e}")
 
         test_msg = await message.answer(
             f"🧪 <b>ТЕСТ-РЕЖИМ</b>\n\n"
             f"Спам удалён: <i>{reason}</i>\n"
             f"Уверенность: {confidence:.0%}\n\n"
-            f"<i>Без предупреждения (вы тестер)</i>",
+            f"<i>Без предупреждения (вы {role_label})</i>",
             parse_mode="HTML"
         )
         await asyncio.sleep(10)
@@ -1180,7 +1183,7 @@ async def process_spam_message(message: Message, reason: str, confidence: float)
             await test_msg.delete()
         except:
             pass
-        logger.info(f"[TESTER] Spam DELETED from {user_name} ({user_id}): {reason} [{confidence:.0%}]")
+        logger.info(f"[{role}] Spam DELETED from {user_name} ({user_id}): {reason} [{confidence:.0%}]")
         return
 
     try:
@@ -1414,8 +1417,7 @@ async def on_verify_click(callback: CallbackQuery):
 @router.message(F.chat.type.in_({"group", "supergroup"}), F.photo)
 async def on_photo_message(message: Message):
     """Обработка фото с OCR"""
-    if message.from_user.id in ADMIN_IDS:
-        return
+    # Админы и тестеры проверяются, но без последствий (в process_spam_message)
 
     if storage.is_whitelisted(message.from_user.id):
         return
@@ -1468,8 +1470,7 @@ async def on_photo_message(message: Message):
 @router.message(F.chat.type.in_({"group", "supergroup"}), F.forward_from | F.forward_from_chat)
 async def on_forward_message(message: Message):
     """Обработка пересланных сообщений"""
-    if message.from_user.id in ADMIN_IDS:
-        return
+    # Админы и тестеры проверяются, но без последствий (в process_spam_message)
 
     if storage.is_whitelisted(message.from_user.id):
         return
@@ -1498,9 +1499,7 @@ async def on_forward_message(message: Message):
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 async def on_group_message(message: Message):
     """Проверка сообщений на спам"""
-    # Пропускаем админов
-    if message.from_user.id in ADMIN_IDS:
-        return
+    # Админы и тестеры проверяются, но без последствий (в process_spam_message)
 
     # Пропускаем whitelist
     if storage.is_whitelisted(message.from_user.id):
@@ -1519,6 +1518,8 @@ async def check_text_for_spam(message: Message, text: str):
     user_id = message.from_user.id
     chat_id = message.chat.id
     is_tester = user_id in TESTER_IDS
+    is_admin = user_id in ADMIN_IDS
+    is_privileged = is_tester or is_admin  # Тестеры и админы - привилегированные
 
     # Записываем активность
     behavior_analyzer.record_message(user_id)
@@ -1528,8 +1529,8 @@ async def check_text_for_spam(message: Message, text: str):
     is_night = is_night_mode()
     text_has_links = has_links(text)
 
-    # Проверка cooldown для новичков (тестеры видят предупреждение, но не блокируются)
-    if is_newbie and not is_tester:
+    # Проверка cooldown для новичков (тестеры/админы видят предупреждение, но не блокируются)
+    if is_newbie and not is_privileged:
         can_send, seconds_left = behavior_analyzer.check_newbie_cooldown(user_id)
         if not can_send:
             try:
@@ -1544,12 +1545,13 @@ async def check_text_for_spam(message: Message, text: str):
                 pass
             return
         behavior_analyzer.record_newbie_message(user_id)
-    elif is_newbie and is_tester:
-        # Тестер-новичок - показываем что сработало бы
+    elif is_newbie and is_privileged:
+        # Тестер/админ-новичок - показываем что сработало бы
         can_send, seconds_left = behavior_analyzer.check_newbie_cooldown(user_id)
         if not can_send:
+            role = "админ" if is_admin else "тестер"
             warn_msg = await message.reply(
-                f"🧪 <b>ТЕСТ:</b> Slow mode ({seconds_left} сек.) — сообщение НЕ удалено",
+                f"🧪 <b>ТЕСТ:</b> Slow mode ({seconds_left} сек.) — сообщение НЕ удалено (вы {role})",
                 parse_mode="HTML"
             )
             await asyncio.sleep(5)
@@ -1561,9 +1563,10 @@ async def check_text_for_spam(message: Message, text: str):
 
     # Ограничение ссылок для новичков
     if is_newbie and text_has_links:
-        if is_tester:
+        if is_privileged:
+            role = "админ" if is_admin else "тестер"
             warn_msg = await message.reply(
-                f"🧪 <b>ТЕСТ:</b> Ссылки для новичков запрещены — сообщение НЕ удалено",
+                f"🧪 <b>ТЕСТ:</b> Ссылки для новичков запрещены — сообщение НЕ удалено (вы {role})",
                 parse_mode="HTML"
             )
             await asyncio.sleep(5)
