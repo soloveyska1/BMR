@@ -2073,7 +2073,7 @@ async def grant_full_permissions_task():
 
 async def main():
     """Запуск бота"""
-    logger.info("Starting spam filter bot v3.0...")
+    logger.info(f"Starting spam filter bot v{BOT_VERSION}...")
     logger.info(f"OCR available: {OCR_AVAILABLE}")
     logger.info(f"Aiohttp available: {AIOHTTP_AVAILABLE}")
     logger.info(f"Night mode: {NIGHT_START} - {NIGHT_END}")
