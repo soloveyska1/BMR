@@ -1846,6 +1846,15 @@ async def check_text_for_spam(message: Message, text: str):
     )
     is_spam, confidence, triggered = ml_classifier.classify(features)
 
+    # DEBUG: Логируем для админов/тестеров
+    if is_privileged:
+        normalized = normalize_text(text)
+        logger.info(f"[DEBUG] Original: {repr(text)}")
+        logger.info(f"[DEBUG] Normalized: {repr(normalized)}")
+        logger.info(f"[DEBUG] Score: {confidence:.2f}, Spam: {is_spam}, Triggered: {triggered}")
+        top_features = {k: v for k, v in features.items() if v > 0}
+        logger.info(f"[DEBUG] Active features: {top_features}")
+
     if is_spam:
         reason = ', '.join(triggered[:3]) if triggered else "подозрительное сообщение"
         await process_spam_message(message, reason, confidence)
