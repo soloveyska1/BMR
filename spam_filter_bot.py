@@ -62,8 +62,8 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("SPAM_ADMIN_IDS", "").split(",") 
 TESTER_IDS = [8420766371]
 
 # Версия и время деплоя (обновляется автоматически)
-BOT_VERSION = "3.4"
-DEPLOY_TIME = "2026-02-03 12:00 MSK"
+BOT_VERSION = "3.5"
+DEPLOY_TIME = "2026-02-03 22:00 MSK"
 
 # Время на верификацию (секунды)
 VERIFY_TIMEOUT = 60
@@ -1092,13 +1092,19 @@ async def process_spam_message(message: Message, reason: str, confidence: float)
     chat_id = message.chat.id
     user_name = message.from_user.full_name or message.from_user.username
 
-    # Тестер - показываем что сработало, но НЕ удаляем и НЕ баним
+    # Тестер - УДАЛЯЕМ сообщение, но БЕЗ предупреждений и бана
     if user_id in TESTER_IDS:
-        test_msg = await message.reply(
+        try:
+            await message.delete()
+            stats["spam_deleted"] += 1
+        except Exception as e:
+            logger.warning(f"[TESTER] Failed to delete message: {e}")
+
+        test_msg = await message.answer(
             f"🧪 <b>ТЕСТ-РЕЖИМ</b>\n\n"
-            f"Обнаружен спам: <i>{reason}</i>\n"
+            f"Спам удалён: <i>{reason}</i>\n"
             f"Уверенность: {confidence:.0%}\n\n"
-            f"<i>Сообщение НЕ удалено (вы тестер)</i>",
+            f"<i>Без предупреждения (вы тестер)</i>",
             parse_mode="HTML"
         )
         await asyncio.sleep(10)
@@ -1106,7 +1112,7 @@ async def process_spam_message(message: Message, reason: str, confidence: float)
             await test_msg.delete()
         except:
             pass
-        logger.info(f"[TESTER] Spam detected from {user_name} ({user_id}): {reason} [{confidence:.0%}]")
+        logger.info(f"[TESTER] Spam DELETED from {user_name} ({user_id}): {reason} [{confidence:.0%}]")
         return
 
     try:
