@@ -1,5 +1,5 @@
 """
-Спам-фильтр бот для Telegram чатов v3.1
+Спам-фильтр бот для Telegram чатов v4.3
 ========================================
 Фичи:
 - ✅ Верификация с правилами чата
@@ -13,6 +13,8 @@
 - ✅ ML-подобный классификатор спама
 - ✅ OCR для изображений (опционально)
 - ✅ Авто-очистка сообщений
+- ✅ RLO/Bidirectional атака детекция
+- ✅ Периодическая очистка памяти
 """
 
 import asyncio
@@ -63,8 +65,13 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("SPAM_ADMIN_IDS", "").split(",") 
 TESTER_IDS = [8420766371]
 
 # Версия и время деплоя (обновляется автоматически)
-BOT_VERSION = "4.2"
-DEPLOY_TIME = "2026-02-04 00:00 MSK"
+BOT_VERSION = "4.3"
+DEPLOY_TIME = "2026-02-03 19:00 MSK"
+
+# Лимиты памяти (для защиты от утечек)
+MAX_VERIFIED_USERS = 50000  # Максимум verified_users в памяти
+MAX_USER_PROFILES = 10000   # Максимум профилей в памяти
+PROFILE_EXPIRE_DAYS = 30    # Удалять профили старше N дней
 
 # Время на верификацию (секунды)
 VERIFY_TIMEOUT = 60
@@ -672,6 +679,47 @@ class UserBehaviorAnalyzer:
         """Записать сообщение новичка"""
         self.newbie_messages[user_id].append(datetime.now())
 
+    def cleanup_old_profiles(self, max_profiles: int = None, expire_days: int = None):
+        """Очистка старых профилей для предотвращения утечки памяти"""
+        if max_profiles is None:
+            max_profiles = MAX_USER_PROFILES
+        if expire_days is None:
+            expire_days = PROFILE_EXPIRE_DAYS
+
+        now = datetime.now()
+        cutoff = now - timedelta(days=expire_days)
+
+        # Удаляем профили старше expire_days без активности
+        old_profiles = [
+            uid for uid, profile in self.profiles.items()
+            if profile.last_message_time and profile.last_message_time < cutoff
+        ]
+        for uid in old_profiles:
+            del self.profiles[uid]
+
+        # Если всё ещё слишком много - удаляем самые старые
+        if len(self.profiles) > max_profiles:
+            # Сортируем по последней активности
+            sorted_profiles = sorted(
+                self.profiles.items(),
+                key=lambda x: x[1].last_message_time or datetime.min
+            )
+            # Удаляем самые старые, чтобы остались max_profiles
+            to_remove = len(self.profiles) - max_profiles
+            for uid, _ in sorted_profiles[:to_remove]:
+                del self.profiles[uid]
+
+        # Очищаем устаревшие записи в других словарях
+        for uid in list(self.message_times.keys()):
+            if uid not in self.profiles:
+                del self.message_times[uid]
+
+        for uid in list(self.newbie_messages.keys()):
+            if uid not in self.profiles:
+                del self.newbie_messages[uid]
+
+        return len(old_profiles)
+
 
 class MLSpamClassifier:
     """ML-подобный классификатор спама на основе весов"""
@@ -712,6 +760,8 @@ class MLSpamClassifier:
             'repeated_near_spam': 0.50,   # Повторные near-spam сообщения
             # === КРИТИЧЕСКИЕ СЛОВА ===
             'critical_keyword': 0.70,     # Слова-маркеры спама (заработок, эскорт и т.п.)
+            # === БЕЗОПАСНОСТЬ ===
+            'rlo_attack': 0.80,           # RLO/Bidirectional атака (очень подозрительно)
         }
         self.threshold = 0.45
 
@@ -745,6 +795,10 @@ class MLSpamClassifier:
         ]
         has_critical = any(kw in normalized for kw in critical_keywords)
         features['critical_keyword'] = 1.0 if has_critical else 0.0
+
+        # === RLO/BIDIRECTIONAL АТАКА ===
+        # Проверяем оригинальный текст на опасные символы
+        features['rlo_attack'] = 1.0 if has_rlo_attack(text) else 0.0
 
         # Ключевые слова
         keyword_count = sum(1 for kw in SPAM_KEYWORDS if kw in normalized)
@@ -1106,9 +1160,32 @@ stats = {
 
 # ============== ФУНКЦИИ ==============
 
+def has_rlo_attack(text: str) -> bool:
+    """Проверить наличие RLO/Bidirectional атаки в тексте"""
+    # Опасные bidirectional символы, которые могут скрывать текст
+    dangerous_bidi = {
+        '\u202a',  # Left-to-Right Embedding (LRE)
+        '\u202b',  # Right-to-Left Embedding (RLE)
+        '\u202c',  # Pop Directional Formatting (PDF)
+        '\u202d',  # Left-to-Right Override (LRO)
+        '\u202e',  # Right-to-Left Override (RLO) - самый опасный!
+        '\u2066',  # Left-to-Right Isolate (LRI)
+        '\u2067',  # Right-to-Left Isolate (RLI)
+        '\u2068',  # First Strong Isolate (FSI)
+        '\u2069',  # Pop Directional Isolate (PDI)
+    }
+    return any(char in text for char in dangerous_bidi)
+
+
 def normalize_text(text: str) -> str:
     """Нормализация текста для поиска спама"""
     text = text.lower()
+
+    # === ЭТАП 0: Удаление RLO/Bidirectional символов ===
+    # Эти символы могут скрывать/переворачивать текст
+    bidi_chars = '\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069'
+    for char in bidi_chars:
+        text = text.replace(char, '')
 
     # === ЭТАП 1: Цифры и символы → буквы (спамеры используют для обхода) ===
     digit_symbol_subs = {
@@ -2302,7 +2379,23 @@ async def auto_cleanup_task():
                 if now - cached_at > cas_checker.cache_ttl:
                     del cas_checker.cache[user_id]
 
-            logger.info("Auto-cleanup completed")
+            # Очистка user profiles для предотвращения утечки памяти
+            cleaned_profiles = behavior_analyzer.cleanup_old_profiles()
+            if cleaned_profiles > 0:
+                logger.info(f"Cleaned {cleaned_profiles} old user profiles")
+
+            # Ограничение размера verified_users
+            global verified_users
+            if len(verified_users) > MAX_VERIFIED_USERS:
+                # Нельзя определить "старых" пользователей в set, просто обрезаем
+                # В реальности это редко случается
+                excess = len(verified_users) - MAX_VERIFIED_USERS
+                logger.warning(f"verified_users overflow! Removing {excess} entries")
+                # Конвертируем в список, удаляем первые N, конвертируем обратно
+                users_list = list(verified_users)
+                verified_users = set(users_list[excess:])
+
+            logger.info(f"Auto-cleanup completed. Profiles: {len(behavior_analyzer.profiles)}, Verified: {len(verified_users)}")
 
         except Exception as e:
             logger.error(f"Auto-cleanup error: {e}")
