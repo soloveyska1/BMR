@@ -2203,7 +2203,7 @@ async def check_text_for_spam(message: Message, text: str):
 @router.message(Command("spam_stats"))
 async def cmd_stats(message: Message):
     """Статистика бота"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     uptime = datetime.now() - stats["start_time"]
@@ -2241,7 +2241,7 @@ async def cmd_stats(message: Message):
 @router.message(Command("spam_add"))
 async def cmd_add_keyword(message: Message):
     """Добавить ключевое слово"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     args = message.text.split(maxsplit=1)
@@ -2260,7 +2260,7 @@ async def cmd_add_keyword(message: Message):
 @router.message(Command("spam_whitelist"))
 async def cmd_whitelist(message: Message):
     """Управление whitelist"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     args = message.text.split()
@@ -2304,7 +2304,7 @@ async def cmd_whitelist(message: Message):
 @router.message(Command("spam_check"))
 async def cmd_check_user(message: Message):
     """Полная проверка пользователя — все данные в одном месте"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     # Получаем user_id из реплая или аргумента
@@ -2387,7 +2387,7 @@ async def cmd_check_user(message: Message):
 @router.message(Command("spam_unban"))
 async def cmd_unban(message: Message):
     """Разбанить пользователя"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     args = message.text.split()
@@ -2416,7 +2416,7 @@ async def cmd_unban(message: Message):
 @router.message(Command("spam_warn"))
 async def cmd_check_warnings(message: Message):
     """Проверить предупреждения пользователя"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     args = message.text.split()
@@ -2438,7 +2438,7 @@ async def cmd_check_warnings(message: Message):
 @router.message(Command("spam_test"))
 async def cmd_test_spam(message: Message):
     """Проверить текст на спам"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     args = message.text.split(maxsplit=1)
@@ -2498,7 +2498,7 @@ async def cmd_test_spam(message: Message):
 @router.message(Command("spam_lockdown"))
 async def cmd_lockdown(message: Message):
     """Управление режимом блокировки (антирейд)"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     args = message.text.split()
@@ -2534,7 +2534,7 @@ async def cmd_lockdown(message: Message):
 @router.message(Command("spam_help"))
 async def cmd_help(message: Message):
     """Помощь по командам"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     await message.answer(
@@ -2550,7 +2550,8 @@ async def cmd_help(message: Message):
         "/spam_warn <id> — проверить предупреждения\n"
         "/spam_unban <id> — разбанить пользователя\n\n"
         "<b>🚨 Антирейд:</b>\n"
-        "/spam_lockdown — управление блокировкой\n\n"
+        "/spam_lockdown — управление блокировкой\n"
+        "/spam_reset — сбросить свой профиль (после тестов)\n\n"
         "<b>🛡 Возможности:</b>\n"
         "• Верификация с правилами БИМ радио\n"
         "• CAS (Combot Anti-Spam)\n"
@@ -2562,6 +2563,38 @@ async def cmd_help(message: Message):
         "• Мат-фильтр",
         parse_mode="HTML"
     )
+
+
+@router.message(Command("spam_reset"))
+async def cmd_reset_profile(message: Message):
+    """Сбросить свой spam профиль (для тестеров/админов)"""
+    user_id = message.from_user.id
+
+    if user_id not in ADMIN_IDS and user_id not in TESTER_IDS:
+        return
+
+    # Сбрасываем профиль
+    if user_id in behavior_analyzer.profiles:
+        del behavior_analyzer.profiles[user_id]
+
+    # Сбрасываем предупреждения
+    if user_id in storage.warnings:
+        del storage.warnings[user_id]
+        storage._save()
+
+    # Удаляем из message_times и newbie_messages
+    behavior_analyzer.message_times.pop(user_id, None)
+    behavior_analyzer.newbie_messages.pop(user_id, None)
+
+    await message.answer(
+        "✅ <b>Профиль сброшен!</b>\n\n"
+        "• spam_score: 0\n"
+        "• warnings: 0\n"
+        "• message_count: 0\n\n"
+        "Теперь ты чист 🧹",
+        parse_mode="HTML"
+    )
+    logger.info(f"Profile reset for user {user_id}")
 
 
 @router.message(Command("start"))
