@@ -62,8 +62,8 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("SPAM_ADMIN_IDS", "").split(",") 
 TESTER_IDS = [8420766371]
 
 # Версия и время деплоя (обновляется автоматически)
-BOT_VERSION = "3.5"
-DEPLOY_TIME = "2026-02-03 22:00 MSK"
+BOT_VERSION = "3.6"
+DEPLOY_TIME = "2026-02-03 22:15 MSK"
 
 # Время на верификацию (секунды)
 VERIFY_TIMEOUT = 60
@@ -689,6 +689,10 @@ class MLSpamClassifier:
             'adult_emojis': 0.45,
             'adult_emoji_combo': 0.60,
             'night_adult': 0.35,
+            # Короткие объявления о работе/услугах
+            'short_work_ad': 0.55,
+            'money_hours_combo': 0.45,
+            'service_offer': 0.40,
         }
         self.threshold = 0.45
 
@@ -790,6 +794,70 @@ class MLSpamClassifier:
         # Ночь + 18+ контент = очень подозрительно
         has_adult_content = adult_count > 0 or adult_emoji_count >= 2
         features['night_adult'] = 1.0 if (is_night and has_adult_content) else 0.0
+
+        # ============== КОРОТКИЕ ОБЪЯВЛЕНИЯ О РАБОТЕ/УСЛУГАХ ==============
+
+        # Проверка на сумму денег (3-6 цифр, возможно с пробелами: 5 000, 4800)
+        money_pattern = r'\d[\d\s]{2,5}\d?\s*(?:₽|руб|р\.?|тыс|т\.р\.)?|\d{3,6}'
+        has_money = bool(re.search(money_pattern, text))
+
+        # Проверка на время/часы
+        hours_pattern = r'\d+\s*(?:час|ч\.|ч\b|часов|часа)|на\s*\d[\-–]\d\s*(?:час|ч)'
+        has_hours = bool(re.search(hours_pattern, original_lower))
+
+        # Призывы к действию
+        cta_words = [
+            "откликнитесь", "откликнись", "откликайтесь", "отклик",
+            "пишите", "пиши", "напишите", "напиши",
+            "звоните", "звони", "позвоните",
+            "обращайтесь", "свяжитесь",
+            "в лс", "в личку", "в личные",
+        ]
+        has_cta = any(w in normalized for w in cta_words)
+
+        # Слова услуг/работы
+        service_words = [
+            "уборка", "мыть", "мойка", "клининг", "подъезд",
+            "помощь", "помочь", "нужна помощь", "требуется",
+            "работа", "подработка", "оплата", "заплатим",
+            "нужен", "нужна", "нужны", "ищу", "ищем",
+            "услуги", "сделаю", "выполню", "готов",
+        ]
+        has_service = any(w in normalized for w in service_words)
+
+        # Короткое сообщение (типичное для спам-объявлений)
+        is_short = len(text) < 200
+
+        # Многострочное короткое сообщение (типа "4800\n5 часов\nОткликнитесь")
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        is_multiline_short = len(lines) >= 2 and all(len(l) < 50 for l in lines)
+
+        # === КОМБИНИРОВАННЫЕ ПРИЗНАКИ ===
+
+        # short_work_ad: короткое + деньги + часы + призыв
+        short_work_score = 0.0
+        if is_short and has_money:
+            short_work_score += 0.3
+        if has_hours:
+            short_work_score += 0.25
+        if has_cta:
+            short_work_score += 0.25
+        if is_multiline_short and has_money:
+            short_work_score += 0.2
+        features['short_work_ad'] = min(short_work_score, 1.0)
+
+        # money_hours_combo: деньги + часы (очень типично для спама)
+        features['money_hours_combo'] = 1.0 if (has_money and has_hours) else 0.0
+
+        # service_offer: услуга + деньги/призыв
+        service_score = 0.0
+        if has_service and has_money:
+            service_score += 0.5
+        if has_service and has_cta:
+            service_score += 0.3
+        if has_service and has_hours:
+            service_score += 0.2
+        features['service_offer'] = min(service_score, 1.0)
 
         return features
 
