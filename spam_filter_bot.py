@@ -21,6 +21,7 @@ import logging
 import hashlib
 import json
 import os
+import unicodedata
 from datetime import datetime, timedelta, time
 from typing import Dict, Set, List, Tuple, Optional
 from collections import defaultdict
@@ -62,8 +63,8 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("SPAM_ADMIN_IDS", "").split(",") 
 TESTER_IDS = [8420766371]
 
 # Версия и время деплоя (обновляется автоматически)
-BOT_VERSION = "3.8"
-DEPLOY_TIME = "2026-02-03 22:45 MSK"
+BOT_VERSION = "4.0"
+DEPLOY_TIME = "2026-02-03 23:30 MSK"
 
 # Время на верификацию (секунды)
 VERIFY_TIMEOUT = 60
@@ -701,6 +702,12 @@ class MLSpamClassifier:
             'short_work_ad': 0.55,
             'money_hours_combo': 0.45,
             'service_offer': 0.40,
+            # === НОВЫЕ УМНЫЕ ФИЧИ ===
+            'obfuscation_score': 0.50,    # Обфускация текста (цифры вместо букв и т.п.)
+            'code_mixing': 0.40,          # Смешивание русского и английского
+            'fuzzy_keyword': 0.35,        # Нечёткое совпадение с ключевыми словами
+            'suspicious_structure': 0.45,  # Подозрительная структура сообщения
+            'repeated_near_spam': 0.50,   # Повторные near-spam сообщения
         }
         self.threshold = 0.45
 
@@ -867,6 +874,95 @@ class MLSpamClassifier:
             service_score += 0.2
         features['service_offer'] = min(service_score, 1.0)
 
+        # ============== НОВЫЕ УМНЫЕ ФИЧИ ==============
+
+        # 1. OBFUSCATION SCORE: Обнаружение обфускации текста
+        # Проверяем оригинальный текст до нормализации
+        obfuscation_score = 0.0
+
+        # Цифры среди букв (з0р0б0т0к)
+        digit_in_word = len(re.findall(r'[а-яёa-z][0-9][а-яёa-z]', original_lower))
+        if digit_in_word > 0:
+            obfuscation_score += min(digit_in_word * 0.3, 0.5)
+
+        # Символы @ $ ! среди букв
+        symbol_in_word = len(re.findall(r'[а-яёa-z][@$!#€][а-яёa-z]', original_lower))
+        if symbol_in_word > 0:
+            obfuscation_score += min(symbol_in_word * 0.3, 0.5)
+
+        # Смешивание скриптов в одном слове (кириллица + латиница)
+        words = text.split()
+        mixed_script_words = 0
+        for word in words:
+            has_cyrillic = bool(re.search(r'[а-яёА-ЯЁ]', word))
+            has_latin = bool(re.search(r'[a-zA-Z]', word))
+            if has_cyrillic and has_latin and len(word) > 2:
+                mixed_script_words += 1
+        if mixed_script_words > 0:
+            obfuscation_score += min(mixed_script_words * 0.25, 0.5)
+
+        # Пробелы между буквами (з а р а б о т о к)
+        spaced_letters = len(re.findall(r'(?<!\S)[а-яёa-z]\s+[а-яёa-z]\s+[а-яёa-z](?!\S)', original_lower))
+        if spaced_letters > 0:
+            obfuscation_score += 0.4
+
+        features['obfuscation_score'] = min(obfuscation_score, 1.0)
+
+        # 2. CODE MIXING: Смешивание русского и английского
+        code_mix_score = 0.0
+        # Английские слова в русском контексте
+        english_words_in_russian = [
+            'work', 'money', 'job', 'earn', 'income', 'cash', 'pay', 'salary',
+            'worker', 'driver', 'manager', 'crypto', 'bitcoin', 'invest',
+            'easy', 'fast', 'quick', 'free', 'bonus', 'profit'
+        ]
+        for eng_word in english_words_in_russian:
+            if eng_word in original_lower:
+                code_mix_score += 0.3
+        features['code_mixing'] = min(code_mix_score, 1.0)
+
+        # 3. FUZZY KEYWORD: Нечёткое совпадение с ключевыми словами
+        # Используем простое сравнение подстрок для поиска опечаток
+        fuzzy_score = 0.0
+        critical_keywords = [
+            'заработок', 'заработай', 'работа', 'подработка', 'доход',
+            'оплата', 'деньги', 'рублей', 'тысяч', 'водитель', 'курьер'
+        ]
+        for word in normalized.split():
+            if len(word) >= 5:  # Проверяем только достаточно длинные слова
+                for kw in critical_keywords:
+                    # Проверяем совпадение 70%+ символов
+                    if len(word) >= len(kw) - 2 and len(word) <= len(kw) + 2:
+                        matches = sum(1 for a, b in zip(word, kw) if a == b)
+                        similarity = matches / max(len(word), len(kw))
+                        if similarity >= 0.7 and similarity < 1.0:  # Похоже, но не точно
+                            fuzzy_score += 0.3
+                            break
+        features['fuzzy_keyword'] = min(fuzzy_score, 1.0)
+
+        # 4. SUSPICIOUS STRUCTURE: Подозрительная структура
+        structure_score = 0.0
+
+        # Очень короткое сообщение с числами
+        if len(text) < 100 and has_money:
+            structure_score += 0.3
+
+        # Много строк, каждая короткая (типичный спам-формат)
+        if is_multiline_short:
+            structure_score += 0.2
+
+        # Заканчивается призывом к действию
+        last_words = normalized.split()[-3:] if normalized else []
+        cta_endings = ['пишите', 'звоните', 'откликнитесь', 'пиши', 'звони']
+        if any(w in last_words for w in cta_endings):
+            structure_score += 0.3
+
+        features['suspicious_structure'] = min(structure_score, 1.0)
+
+        # 5. REPEATED NEAR SPAM: Проверяем историю пользователя
+        # (будет использоваться вместе с behavior_analyzer)
+        features['repeated_near_spam'] = min(user_profile.spam_score * 1.5, 1.0)
+
         return features
 
     def classify(self, features: Dict[str, float]) -> Tuple[bool, float, List[str]]:
@@ -987,7 +1083,27 @@ def normalize_text(text: str) -> str:
     """Нормализация текста для поиска спама"""
     text = text.lower()
 
-    # Базовые латинские → кириллица (визуальные и фонетические сходства)
+    # === ЭТАП 1: Цифры и символы → буквы (спамеры используют для обхода) ===
+    digit_symbol_subs = {
+        '0': 'о',  # 0 → о
+        '1': 'и',  # 1 → и (или l)
+        '3': 'з',  # 3 → з
+        '4': 'а',  # 4 → а
+        '5': 'с',  # 5 → с (или s)
+        '7': 'т',  # 7 → т
+        '8': 'в',  # 8 → в
+        '9': 'д',  # 9 → д (похоже)
+        '@': 'а',  # @ → а
+        '$': 'с',  # $ → с
+        '!': 'и',  # ! → и (в словах типа пиш!те)
+        '#': 'н',  # # → н
+        '€': 'е',  # € → е
+        '₽': 'р',  # ₽ → р (но это валюта, оставим в паттернах)
+    }
+    for sym, cyr in digit_symbol_subs.items():
+        text = text.replace(sym, cyr)
+
+    # === ЭТАП 2: Базовые латинские → кириллица ===
     replacements = {
         # Визуально похожие
         'a': 'а', 'e': 'е', 'o': 'о', 'p': 'р', 'c': 'с',
@@ -1072,9 +1188,55 @@ def normalize_text(text: str) -> str:
     for homo, cyr in homoglyphs.items():
         text = text.replace(homo, cyr)
 
-    zero_width = '\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff'
+    # === ЭТАП 4: Удаление zero-width и невидимых символов ===
+    zero_width = (
+        '\u200b'  # Zero Width Space
+        '\u200c'  # Zero Width Non-Joiner
+        '\u200d'  # Zero Width Joiner
+        '\u200e'  # Left-to-Right Mark
+        '\u200f'  # Right-to-Left Mark
+        '\u2060'  # Word Joiner
+        '\u2061'  # Function Application
+        '\u2062'  # Invisible Times
+        '\u2063'  # Invisible Separator
+        '\u2064'  # Invisible Plus
+        '\u00ad'  # Soft Hyphen
+        '\ufeff'  # Zero Width No-Break Space (BOM)
+        '\u034f'  # Combining Grapheme Joiner
+        '\u061c'  # Arabic Letter Mark
+        '\u115f'  # Hangul Choseong Filler
+        '\u1160'  # Hangul Jungseong Filler
+        '\u17b4'  # Khmer Vowel Inherent Aq
+        '\u17b5'  # Khmer Vowel Inherent Aa
+        '\u180e'  # Mongolian Vowel Separator
+        '\u2800'  # Braille Pattern Blank
+        '\u3164'  # Hangul Filler
+        '\uffa0'  # Halfwidth Hangul Filler
+    )
     for char in zero_width:
         text = text.replace(char, '')
+
+    # === ЭТАП 5: Удаление combining marks (диакритических знаков) ===
+    # Спамеры добавляют их для обхода: з̧а̊р̀а̧б̱о̫т̰о̷к
+    text = ''.join(c for c in text if unicodedata.category(c) != 'Mn')
+
+    # === ЭТАП 6: Удаление пробелов между одиночными буквами ===
+    # "з а р а б о т о к" → "заработок"
+    # Паттерн: буква + пробел + буква + пробел... (минимум 3 буквы через пробелы)
+    def collapse_spaced_letters(t):
+        # Ищем последовательности: буква пробел буква пробел буква...
+        pattern = r'(?<!\S)([а-яёa-z])\s+(?=[а-яёa-z]\s*[а-яёa-z])'
+        # Убираем пробелы между одиночными буквами
+        result = re.sub(r'\b([а-яёa-z])\s+([а-яёa-z])\s+([а-яёa-z])', r'\1\2\3', t)
+        # Повторяем несколько раз для длинных последовательностей
+        for _ in range(5):
+            new_result = re.sub(r'\b([а-яёa-z])\s+([а-яёa-z])\b', r'\1\2', result)
+            if new_result == result:
+                break
+            result = new_result
+        return result
+
+    text = collapse_spaced_letters(text)
 
     text = re.sub(r'[^\w\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text)
