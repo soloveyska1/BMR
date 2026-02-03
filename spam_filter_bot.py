@@ -1668,7 +1668,7 @@ def get_verify_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Клавиатура для верификации"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text="🎵 Я слушаю БИМ радио и принимаю правила!",
+            text="📻 Хочу быть люБИМцем эфира!",
             callback_data=f"verify_{user_id}"
         )]
     ])
@@ -1745,12 +1745,12 @@ async def process_spam_message(message: Message, reason: str, confidence: float)
         # Проверяем на авто-бан
         if warnings >= MAX_WARNINGS:
             await auto_ban_user(user_id, chat_id, f"Превышен лимит предупреждений ({MAX_WARNINGS})")
-            warn_text = f"🚫 <b>{user_name}</b> забанен.\nПричина: {MAX_WARNINGS} предупреждений"
+            warn_text = f"📻🚫 <b>{user_name}</b> отключён от эфира.\n{MAX_WARNINGS} помех — это перебор!"
         else:
             warn_text = (
-                f"⚠️ Сообщение удалено.\n"
+                f"📻 Помехи в эфире! Сообщение удалено.\n"
                 f"<i>Причина: {reason}</i>\n"
-                f"Предупреждение: {warnings}/{MAX_WARNINGS}"
+                f"⚠️ Предупреждение: {warnings}/{MAX_WARNINGS}"
             )
 
         warn_msg = await message.answer(warn_text, parse_mode="HTML")
@@ -1950,9 +1950,9 @@ async def on_verify_click(callback: CallbackQuery):
         audit_logger.log_user_verified(user_id, callback.message.chat.id)
 
         await callback.message.edit_text(
-            f"🎉 <b>{callback.from_user.full_name}</b> теперь с нами!\n\n"
-            f"🎵 Добро пожаловать в семью БИМ радио!\n"
-            f"Слушай 102.8 FM и общайся с нами 📻",
+            f"🎉 <b>{callback.from_user.full_name}</b> теперь люБИМец эфира!\n\n"
+            f"📻 Добро пожаловать на волну 102.8 FM!\n"
+            f"Общайся, слушай, будь на связи 🎵",
             parse_mode="HTML"
         )
 
@@ -2039,7 +2039,7 @@ async def on_forward_message(message: Message):
             await message.delete()
             stats["newbie_restricted"] += 1
             warn_msg = await message.answer(
-                f"⚠️ Новые участники не могут пересылать сообщения первые {NEWBIE_HOURS} часов.",
+                f"📻 Репосты — только для люБИМцев со стажем! Подожди {NEWBIE_HOURS}ч 🎵",
                 parse_mode="HTML"
             )
             await asyncio.sleep(5)
@@ -2095,7 +2095,7 @@ async def check_text_for_spam(message: Message, text: str):
                 await message.delete()
                 stats["newbie_restricted"] += 1
                 warn_msg = await message.answer(
-                    f"⏳ Подождите {seconds_left} сек. (slow mode для новых участников)",
+                    f"📻 Настройся на волну! Подожди {seconds_left} сек. 🎵",
                 )
                 await asyncio.sleep(3)
                 await warn_msg.delete()
@@ -2137,7 +2137,7 @@ async def check_text_for_spam(message: Message, text: str):
                 await message.delete()
                 stats["newbie_restricted"] += 1
                 warn_msg = await message.answer(
-                    f"🔗 Новые участники не могут отправлять ссылки первые {NEWBIE_HOURS} часов.",
+                    f"📻 Ссылки в эфир — только для люБИМцев со стажем! Подожди {NEWBIE_HOURS}ч 🎵",
                 )
                 await asyncio.sleep(5)
                 await warn_msg.delete()
@@ -2587,11 +2587,10 @@ async def cmd_reset_profile(message: Message):
     behavior_analyzer.newbie_messages.pop(user_id, None)
 
     await message.answer(
-        "✅ <b>Профиль сброшен!</b>\n\n"
-        "• spam_score: 0\n"
-        "• warnings: 0\n"
-        "• message_count: 0\n\n"
-        "Теперь ты чист 🧹",
+        "📻 <b>Эфир очищен!</b>\n\n"
+        "• Репутация: чистая\n"
+        "• Предупреждения: 0\n\n"
+        "Снова на чистой волне 102.8 FM 🎵",
         parse_mode="HTML"
     )
     logger.info(f"Profile reset for user {user_id}")
@@ -2605,24 +2604,23 @@ async def cmd_start(message: Message):
 
     is_admin = message.from_user.id in ADMIN_IDS
 
+    is_tester = message.from_user.id in TESTER_IDS
+
     await message.answer(
-        "🎙 <b>БИМ радио 102.8 FM — Антиспам бот v3.0</b>\n\n"
-        "Привет! Я защищаю чат нашей радиостанции от спама и ботов.\n\n"
+        f"📻 <b>БИМ радио 102.8 FM — Защитник эфира v{BOT_VERSION}</b>\n\n"
+        "Привет, люБИМец! Я охраняю наш чат от спамеров и помех в эфире.\n\n"
         "<b>Мои суперсилы:</b>\n"
         "🎵 Верификация новых слушателей\n"
-        "🛡 CAS (Combot Anti-Spam) проверка\n"
-        "⚠️ Авто-бан после 5 предупреждений\n"
+        "🛡 CAS антиспам проверка\n"
+        "📻 5 помех — отключение от эфира\n"
         "🌙 Ночной режим (23:00-07:00)\n"
-        "📝 Whitelist для доверенных\n"
-        "⏳ Slow mode для новичков\n"
-        "🔗 Защита от спам-ссылок\n"
-        "🤖 ML классификация спама\n"
-        "📷 Распознавание текста на картинках\n"
-        "🤬 Мат-фильтр\n"
+        "⏳ Адаптация для новичков\n"
+        "🤖 Умная ML-фильтрация\n"
+        "📷 Проверка картинок\n"
         "🚨 Антирейд защита\n\n"
-        "📻 <b>Слушай БИМ радио 102.8 FM!</b>\n\n"
-        + ("👑 <b>Вы администратор бота</b>\n"
-           "/spam_help — все команды" if is_admin else ""),
+        "🎵 <b>Слушай 102.8 FM — будь на волне!</b>\n\n"
+        + ("👑 <b>Вы в команде эфира!</b>\n"
+           "/spam_help — все команды" if (is_admin or is_tester) else ""),
         parse_mode="HTML"
     )
 
