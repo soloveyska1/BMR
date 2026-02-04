@@ -1,18 +1,22 @@
 """
-Спам-фильтр бот для Telegram чатов v3.1
+Спам-фильтр бот для Telegram чатов v4.4
 ========================================
 Фичи:
 - ✅ Верификация с правилами чата
-- ✅ CAS (Combot Anti-Spam) интеграция
+- ✅ CAS (Combot Anti-Spam) интеграция + Rate Limiting
 - ✅ Авто-бан после 5 предупреждений
 - ✅ Ночной режим (23:00-07:00)
 - ✅ Белый список (whitelist)
 - ✅ Уведомления админам
 - ✅ Slow mode для новых юзеров
 - ✅ Ограничение ссылок/пересылок для новичков
-- ✅ ML-подобный классификатор спама
+- ✅ ML-подобный классификатор спама с динамическим порогом
 - ✅ OCR для изображений (опционально)
 - ✅ Авто-очистка сообщений
+- ✅ RLO/Bidirectional атака детекция
+- ✅ Периодическая очистка памяти
+- ✅ Аудит логирование
+- ✅ Улучшенная детекция script mixing
 """
 
 import asyncio
@@ -21,6 +25,7 @@ import logging
 import hashlib
 import json
 import os
+import unicodedata
 from datetime import datetime, timedelta, time
 from typing import Dict, Set, List, Tuple, Optional
 from collections import defaultdict
@@ -62,8 +67,21 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("SPAM_ADMIN_IDS", "").split(",") 
 TESTER_IDS = [8420766371]
 
 # Версия и время деплоя (обновляется автоматически)
-BOT_VERSION = "3.3"
-DEPLOY_TIME = "2026-02-02 05:15 MSK"
+BOT_VERSION = "4.4"
+DEPLOY_TIME = "2026-02-03 20:00 MSK"
+
+# Лимиты памяти (для защиты от утечек)
+MAX_VERIFIED_USERS = 50000  # Максимум verified_users в памяти
+MAX_USER_PROFILES = 10000   # Максимум профилей в памяти
+PROFILE_EXPIRE_DAYS = 30    # Удалять профили старше N дней
+
+# Rate limiting для CAS API
+CAS_RATE_LIMIT = 30         # Максимум запросов в минуту
+CAS_RATE_WINDOW = 60        # Окно в секундах
+
+# Аудит логирование (AUDIT_LOG_FILE определяется после DATA_DIR)
+AUDIT_LOG_ENABLED = True
+MAX_AUDIT_SIZE_MB = 50      # Максимальный размер лог файла
 
 # Время на верификацию (секунды)
 VERIFY_TIMEOUT = 60
@@ -91,6 +109,7 @@ DATA_DIR = Path(__file__).parent / "spam_bot_data"
 DATA_DIR.mkdir(exist_ok=True)
 WHITELIST_FILE = DATA_DIR / "whitelist.json"
 WARNINGS_FILE = DATA_DIR / "warnings.json"
+AUDIT_LOG_FILE = DATA_DIR / "audit.log"
 
 # ============== ПРАВИЛА ЧАТА ==============
 CHAT_RULES = """
@@ -110,8 +129,10 @@ CHAT_RULES = """
 
 # ============== СТОП-СЛОВА ==============
 SPAM_KEYWORDS = [
-    # Работа/Заработок (расширенный)
+    # Работа/Заработок (расширенный + разбитые варианты)
     "заработок", "заработай", "заработать", "зарабатывай", "зарабатывать",
+    "работок", "за работок", "за работай", "за работать",  # Разбитые пробелом
+    "зароботок", "зароботай", "заробот",  # Опечатки
     "пассивный доход", "легкий заработок", "быстрый заработок",
     "удаленная работа", "работа на дому",
     "без опыта", "без вложений", "гарантированный доход",
@@ -120,6 +141,14 @@ SPAM_KEYWORDS = [
     "обучение платное", "вводный курс",
     "требуются сотрудники", "набираем людей", "ищем сотрудников",
     "требуются на завтра", "требуются на сегодня", "нужны люди",
+    # Вакансии (водители, курьеры и т.п.)
+    "нужны водител", "нужен водитель", "требуются водител",
+    "нужны курьер", "нужен курьер", "требуются курьер",
+    "нужны грузчик", "нужен грузчик", "требуются грузчик",
+    "нужны разнорабоч", "требуются разнорабоч",
+    "нужны продавц", "требуются продавц",
+    "оплата от", "оплата в день", "ежедневная оплата",
+    "в день", "р день", "р/день", "руб/день", "рублей день",
     "оплата сразу", "оплата ежедневно", "оплата в тот же день",
     "высокий доход", "хороший доход", "стабильный доход",
     "дополнительный доход", "дополнительный заработок",
@@ -138,6 +167,15 @@ SPAM_KEYWORDS = [
     "опыт в домашних делах", "домашние дела",
     "внимательность важна", "ответственность важна",
     "удобное расписание", "свободный график", "гибкий график",
+    # Объявления о работе / услугах
+    "откликнитесь", "откликнись", "отклик", "откликайтесь",
+    "на руки", "на карту сразу", "оплата наличными",
+    "помощь по дому", "помощь по хозяйству", "уборка квартир",
+    "мыть подъезды", "уборка подъездов", "клининг",
+    "нужна помощь", "нужнa помощь", "нужна пȯмȯщь",
+    "работа на сегодня", "работа на завтра", "работы на",
+    "рублей в час", "рублей за час", "руб в час", "руб за час",
+    "часов работы", "часа работы", "час работы",
 
     # Крипта/Инвестиции
     "крипта", "криптовалюта", "биткоин", "эфир", "тонкоин",
@@ -319,6 +357,22 @@ SPAM_PATTERNS = [
 
     # 18+ эмодзи комбо (3+ подряд)
     r"(?:[🔞💋🍑🍆👅💦🔥😈]){3,}",
+
+    # ============== КОРОТКИЕ ОБЪЯВЛЕНИЯ О РАБОТЕ ==============
+    # Паттерн: сумма + часы + призыв (типа "4800\n5 часов\nОткликнитесь")
+    r"\d{3,5}\s*[\n\r]+\s*\d+\s*(?:час|ч\.)",
+    r"(?:откликн|отклик)[а-яё]*",
+    # Помощь по дому + оплата
+    r"(?:помощь|помочь)\s+(?:по\s+)?(?:дому|хозяйству|квартире).*?\d{3,}",
+    r"(?:уборк|мыть|мойка|клининг).*?\d{3,}",
+    # Оплата на руки
+    r"\d{3,}\s*(?:₽|руб|р\.?)?\s*(?:на\s+руки|наличными|на\s+карту)",
+    r"(?:оплата|платим|заплатим)\s*\d{3,}\s*(?:₽|руб|р\.?)?",
+    # Работа на X часов (1-2 часа, 3-4 часа)
+    r"(?:работ[аы]|рабȯт[аы])\s*(?:на|нɑ)\s*\d[\-–]\d\s*(?:час|ч\.)",
+    r"\d[\-–]\d\s*(?:час|ч\.?).*?(?:оплата|\d{3,})",
+    # Сумма денег как отдельная строка (4800, 5000, etc)
+    r"^\d{4,5}$",
 ]
 
 # Слова-индикаторы работы
@@ -329,6 +383,12 @@ WORK_INDICATORS = [
     "опыт", "график", "расписание",
     "оплата", "зарплата", "доход",
     "деньги", "денег", "заработок",
+    # Объявления об услугах
+    "откликнитесь", "откликнись", "откликайтесь",
+    "на руки", "наличными", "на карту",
+    "помощь по дому", "помощь по хозяйству",
+    "уборка", "мыть", "клининг", "подъезд",
+    "часов", "часа", "час",
 ]
 
 # Слова-индикаторы призыва в ЛС
@@ -368,6 +428,102 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# ============== АУДИТ ЛОГИРОВАНИЕ ==============
+
+class AuditLogger:
+    """Система аудит-логирования действий бота"""
+
+    def __init__(self, log_file: Path = None, max_size_mb: int = 50):
+        self.log_file = log_file or AUDIT_LOG_FILE
+        self.max_size_bytes = max_size_mb * 1024 * 1024
+        self.enabled = AUDIT_LOG_ENABLED
+
+    def _rotate_if_needed(self):
+        """Ротация лог-файла при превышении размера"""
+        if not self.log_file.exists():
+            return
+        if self.log_file.stat().st_size > self.max_size_bytes:
+            # Переименовываем старый файл
+            backup = self.log_file.with_suffix('.log.old')
+            if backup.exists():
+                backup.unlink()
+            self.log_file.rename(backup)
+
+    def log(self, action: str, user_id: int = None, chat_id: int = None,
+            details: str = None, severity: str = "INFO"):
+        """Записать действие в аудит лог"""
+        if not self.enabled:
+            return
+
+        try:
+            self._rotate_if_needed()
+
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            entry = {
+                "ts": timestamp,
+                "action": action,
+                "severity": severity
+            }
+            if user_id:
+                entry["user_id"] = user_id
+            if chat_id:
+                entry["chat_id"] = chat_id
+            if details:
+                entry["details"] = details[:500]  # Ограничиваем длину
+
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        except Exception as e:
+            logger.warning(f"Audit log error: {e}")
+
+    def log_spam_detected(self, user_id: int, chat_id: int, text: str,
+                          score: float, triggered: List[str]):
+        """Логировать обнаружение спама"""
+        self.log(
+            action="SPAM_DETECTED",
+            user_id=user_id,
+            chat_id=chat_id,
+            details=f"score={score:.2f} triggers={triggered} text={text[:100]}",
+            severity="WARN"
+        )
+
+    def log_user_banned(self, user_id: int, chat_id: int, reason: str):
+        """Логировать бан пользователя"""
+        self.log(
+            action="USER_BANNED",
+            user_id=user_id,
+            chat_id=chat_id,
+            details=reason,
+            severity="WARN"
+        )
+
+    def log_user_verified(self, user_id: int, chat_id: int):
+        """Логировать верификацию пользователя"""
+        self.log(
+            action="USER_VERIFIED",
+            user_id=user_id,
+            chat_id=chat_id,
+            severity="INFO"
+        )
+
+    def log_security_event(self, event_type: str, user_id: int = None,
+                           chat_id: int = None, details: str = None):
+        """Логировать событие безопасности"""
+        self.log(
+            action=f"SECURITY_{event_type}",
+            user_id=user_id,
+            chat_id=chat_id,
+            details=details,
+            severity="ALERT"
+        )
+
+
+# Глобальный экземпляр аудит логгера
+audit_logger = AuditLogger()
+
 
 # ============== КЛАССЫ ДАННЫХ ==============
 
@@ -460,11 +616,27 @@ class PersistentStorage:
 
 
 class CASChecker:
-    """Проверка через Combot Anti-Spam API"""
+    """Проверка через Combot Anti-Spam API с rate limiting"""
 
     def __init__(self):
         self.cache: Dict[int, Tuple[bool, datetime]] = {}
         self.cache_ttl = timedelta(hours=24)
+        # Rate limiting
+        self.request_times: List[datetime] = []
+        self.rate_limit = CAS_RATE_LIMIT
+        self.rate_window = CAS_RATE_WINDOW
+
+    def _check_rate_limit(self) -> bool:
+        """Проверить, не превышен ли лимит запросов"""
+        now = datetime.now()
+        cutoff = now - timedelta(seconds=self.rate_window)
+        # Очищаем старые записи
+        self.request_times = [t for t in self.request_times if t > cutoff]
+        return len(self.request_times) < self.rate_limit
+
+    def _record_request(self):
+        """Записать время запроса"""
+        self.request_times.append(datetime.now())
 
     async def check(self, user_id: int) -> bool:
         """Проверить пользователя в CAS базе"""
@@ -477,7 +649,13 @@ class CASChecker:
             if datetime.now() - cached_at < self.cache_ttl:
                 return is_banned
 
+        # Проверяем rate limit
+        if not self._check_rate_limit():
+            logger.warning(f"CAS rate limit exceeded, skipping check for {user_id}")
+            return False
+
         try:
+            self._record_request()
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     CAS_API_URL,
@@ -489,6 +667,9 @@ class CASChecker:
                         is_banned = data.get("ok", False)
                         self.cache[user_id] = (is_banned, datetime.now())
                         return is_banned
+                    elif response.status == 429:  # Too Many Requests
+                        logger.warning("CAS API rate limited us!")
+                        return False
         except Exception as e:
             logger.warning(f"CAS check failed for {user_id}: {e}")
 
@@ -630,36 +811,103 @@ class UserBehaviorAnalyzer:
         """Записать сообщение новичка"""
         self.newbie_messages[user_id].append(datetime.now())
 
+    def cleanup_old_profiles(self, max_profiles: int = None, expire_days: int = None):
+        """Очистка старых профилей для предотвращения утечки памяти"""
+        if max_profiles is None:
+            max_profiles = MAX_USER_PROFILES
+        if expire_days is None:
+            expire_days = PROFILE_EXPIRE_DAYS
+
+        now = datetime.now()
+        cutoff = now - timedelta(days=expire_days)
+
+        # Удаляем профили старше expire_days без активности
+        old_profiles = [
+            uid for uid, profile in self.profiles.items()
+            if profile.last_message_time and profile.last_message_time < cutoff
+        ]
+        for uid in old_profiles:
+            del self.profiles[uid]
+
+        # Если всё ещё слишком много - удаляем самые старые
+        if len(self.profiles) > max_profiles:
+            # Сортируем по последней активности
+            sorted_profiles = sorted(
+                self.profiles.items(),
+                key=lambda x: x[1].last_message_time or datetime.min
+            )
+            # Удаляем самые старые, чтобы остались max_profiles
+            to_remove = len(self.profiles) - max_profiles
+            for uid, _ in sorted_profiles[:to_remove]:
+                del self.profiles[uid]
+
+        # Очищаем устаревшие записи в других словарях
+        for uid in list(self.message_times.keys()):
+            if uid not in self.profiles:
+                del self.message_times[uid]
+
+        for uid in list(self.newbie_messages.keys()):
+            if uid not in self.profiles:
+                del self.newbie_messages[uid]
+
+        return len(old_profiles)
+
 
 class MLSpamClassifier:
-    """ML-подобный классификатор спама на основе весов"""
+    """ML-подобный классификатор спама на основе весов с динамическим порогом"""
 
     def __init__(self):
-        # Веса для разных признаков
+        # === ВЕСА ПО КАТЕГОРИЯМ ===
+        # КРИТИЧЕСКИЕ (0.50+) - одного достаточно для спама
+        # ВЫСОКИЕ (0.30-0.49) - сильный сигнал
+        # СРЕДНИЕ (0.15-0.29) - умеренный сигнал
+        # НИЗКИЕ (0.05-0.14) - слабый сигнал, нужна комбинация
+
         self.weights = {
-            'keyword_match': 0.3,
-            'root_match': 0.25,
-            'pattern_match': 0.35,
-            'work_dm_combo': 0.5,
-            'phone_cta': 0.4,
-            'many_emojis': 0.15,
-            'link': 0.2,
-            'mention': 0.15,
-            'caps': 0.1,
-            'duplicate': 0.4,
-            'suspicious_profile': 0.25,
-            'cas_banned': 0.8,
-            'profanity': 0.3,
-            'newbie_link': 0.35,
-            'night_mode': 0.1,
-            # 18+ / Adult spam weights
-            'adult_keywords': 0.50,
-            'luring_keywords': 0.55,
-            'adult_emojis': 0.45,
-            'adult_emoji_combo': 0.60,
-            'night_adult': 0.35,
+            # === КРИТИЧЕСКИЕ (instant spam) ===
+            'rlo_attack': 0.55,           # RLO/Bidirectional атака
+            'cas_banned': 0.55,           # CAS бан
+            'critical_keyword': 0.50,     # Слова-маркеры (заработок, эскорт)
+
+            # === ВЫСОКИЕ ===
+            'adult_emoji_combo': 0.45,    # Комбо 18+ эмодзи
+            'work_dm_combo': 0.40,        # Работа + ЛС
+            'luring_keywords': 0.40,      # Переманивающие слова
+            'adult_keywords': 0.38,       # 18+ ключевые слова
+            'duplicate': 0.35,            # Дубликат сообщения
+            'short_work_ad': 0.35,        # Короткое объявление о работе
+            'phone_cta': 0.32,            # Телефон + призыв
+            'obfuscation_score': 0.32,    # Обфускация текста
+
+            # === СРЕДНИЕ ===
+            'pattern_match': 0.28,        # Совпадение паттернов
+            'money_hours_combo': 0.28,    # Деньги + часы
+            'newbie_link': 0.26,          # Новичок + ссылка
+            'adult_emojis': 0.25,         # 18+ эмодзи
+            'service_offer': 0.25,        # Предложение услуг
+            'night_adult': 0.24,          # Ночь + 18+
+            'suspicious_structure': 0.24, # Подозрительная структура
+            'keyword_match': 0.22,        # Ключевые слова
+            'code_mixing': 0.22,          # Смешивание языков
+            'root_match': 0.20,           # Корни слов
+            'profanity': 0.20,            # Мат
+            'repeated_near_spam': 0.20,   # Повторный near-spam
+            'fuzzy_keyword': 0.18,        # Нечёткое совпадение
+            'link': 0.16,                 # Ссылка
+            'suspicious_profile': 0.16,   # Подозрительный профиль
+
+            # === НИЗКИЕ (модификаторы) ===
+            'mention': 0.10,              # Упоминание
+            'many_emojis': 0.08,          # Много эмодзи
+            'caps': 0.06,                 # Капс
+            'night_mode': 0.05,           # Ночной режим (модификатор)
         }
-        self.threshold = 0.45
+
+        # Базовые пороги
+        self.base_threshold = 0.45
+        self.newbie_threshold = 0.35      # Строже для новичков
+        self.night_threshold = 0.40       # Строже ночью
+        self.verified_threshold = 0.50    # Мягче для проверенных
 
     def extract_features(self, text: str, user_profile: UserProfile,
                          is_newbie: bool, is_night: bool, has_link: bool,
@@ -668,6 +916,33 @@ class MLSpamClassifier:
         features = {}
         normalized = normalize_text(text)
         original_lower = text.lower()
+
+        # === КРИТИЧЕСКИЕ СЛОВА (сами по себе = спам) ===
+        critical_keywords = [
+            # Заработок/работа спам
+            'заработок', 'заработай', 'заработать', 'зарабатывай',
+            'пассивный доход', 'легкий заработок', 'быстрый заработок',
+            'доход от', 'зарплата от', 'оплата от',
+            # Вакансии-спам
+            'требуются сотрудники', 'набираем людей', 'нужны люди',
+            'нужны водител', 'требуются водител', 'нужны курьер',
+            # Крипта/инвестиции
+            'криптовалют', 'биткоин', 'инвестиц', 'трейдинг',
+            'пассивный заработок', 'деньги на автомате',
+            # 18+ / Эскорт
+            'эскорт', 'интим услуг', 'индивидуалк', 'массаж для мужчин',
+            'девушки на час', 'досуг',
+            # Казино
+            'казино', 'ставки на спорт', '1xbet', '1win',
+            # Лохотрон
+            'без вложений', 'гарантированный доход',
+        ]
+        has_critical = any(kw in normalized for kw in critical_keywords)
+        features['critical_keyword'] = 1.0 if has_critical else 0.0
+
+        # === RLO/BIDIRECTIONAL АТАКА ===
+        # Проверяем оригинальный текст на опасные символы
+        features['rlo_attack'] = 1.0 if has_rlo_attack(text) else 0.0
 
         # Ключевые слова
         keyword_count = sum(1 for kw in SPAM_KEYWORDS if kw in normalized)
@@ -760,10 +1035,226 @@ class MLSpamClassifier:
         has_adult_content = adult_count > 0 or adult_emoji_count >= 2
         features['night_adult'] = 1.0 if (is_night and has_adult_content) else 0.0
 
+        # ============== КОРОТКИЕ ОБЪЯВЛЕНИЯ О РАБОТЕ/УСЛУГАХ ==============
+
+        # Проверка на сумму денег (3-6 цифр, возможно с пробелами: 5 000, 4800)
+        money_pattern = r'\d[\d\s]{2,5}\d?\s*(?:₽|руб|р\.?|тыс|т\.р\.)?|\d{3,6}'
+        has_money = bool(re.search(money_pattern, text))
+
+        # Проверка на время/часы
+        hours_pattern = r'\d+\s*(?:час|ч\.|ч\b|часов|часа)|на\s*\d[\-–]\d\s*(?:час|ч)'
+        has_hours = bool(re.search(hours_pattern, original_lower))
+
+        # Призывы к действию
+        cta_words = [
+            "откликнитесь", "откликнись", "откликайтесь", "отклик",
+            "пишите", "пиши", "напишите", "напиши",
+            "звоните", "звони", "позвоните",
+            "обращайтесь", "свяжитесь",
+            "в лс", "в личку", "в личные",
+        ]
+        has_cta = any(w in normalized for w in cta_words)
+
+        # Слова услуг/работы
+        service_words = [
+            "уборка", "мыть", "мойка", "клининг", "подъезд",
+            "помощь", "помочь", "нужна помощь", "требуется",
+            "работа", "подработка", "оплата", "заплатим",
+            "нужен", "нужна", "нужны", "ищу", "ищем",
+            "услуги", "сделаю", "выполню", "готов",
+        ]
+        has_service = any(w in normalized for w in service_words)
+
+        # Короткое сообщение (типичное для спам-объявлений)
+        is_short = len(text) < 200
+
+        # Многострочное короткое сообщение (типа "4800\n5 часов\nОткликнитесь")
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        is_multiline_short = len(lines) >= 2 and all(len(l) < 50 for l in lines)
+
+        # === КОМБИНИРОВАННЫЕ ПРИЗНАКИ ===
+
+        # short_work_ad: короткое + деньги + часы + призыв
+        short_work_score = 0.0
+        if is_short and has_money:
+            short_work_score += 0.3
+        if has_hours:
+            short_work_score += 0.25
+        if has_cta:
+            short_work_score += 0.25
+        if is_multiline_short and has_money:
+            short_work_score += 0.2
+        features['short_work_ad'] = min(short_work_score, 1.0)
+
+        # money_hours_combo: деньги + часы (очень типично для спама)
+        features['money_hours_combo'] = 1.0 if (has_money and has_hours) else 0.0
+
+        # service_offer: услуга + деньги/призыв
+        service_score = 0.0
+        if has_service and has_money:
+            service_score += 0.5
+        if has_service and has_cta:
+            service_score += 0.3
+        if has_service and has_hours:
+            service_score += 0.2
+        features['service_offer'] = min(service_score, 1.0)
+
+        # ============== НОВЫЕ УМНЫЕ ФИЧИ ==============
+
+        # 1. OBFUSCATION SCORE: Обнаружение обфускации текста
+        # Проверяем оригинальный текст до нормализации
+        obfuscation_score = 0.0
+
+        # Цифры среди букв (з0р0б0т0к)
+        digit_in_word = len(re.findall(r'[а-яёa-z][0-9][а-яёa-z]', original_lower))
+        if digit_in_word > 0:
+            obfuscation_score += min(digit_in_word * 0.3, 0.5)
+
+        # Символы @ $ ! среди букв
+        symbol_in_word = len(re.findall(r'[а-яёa-z][@$!#€][а-яёa-z]', original_lower))
+        if symbol_in_word > 0:
+            obfuscation_score += min(symbol_in_word * 0.3, 0.5)
+
+        # Смешивание скриптов в одном слове (кириллица + латиница)
+        words = text.split()
+        mixed_script_words = 0
+        suspicious_mixed_words = []
+        for word in words:
+            # Убираем пунктуацию для анализа
+            clean_word = re.sub(r'[^\w]', '', word)
+            if len(clean_word) < 3:
+                continue
+
+            cyrillic_chars = re.findall(r'[а-яёА-ЯЁ]', clean_word)
+            latin_chars = re.findall(r'[a-zA-Z]', clean_word)
+
+            if cyrillic_chars and latin_chars:
+                mixed_script_words += 1
+                suspicious_mixed_words.append(clean_word)
+
+                # Особо подозрительно: латиница в середине кириллического слова
+                # Например: "рaбота" (латинская 'a' среди кириллицы)
+                if len(cyrillic_chars) > len(latin_chars):
+                    obfuscation_score += 0.3  # Явная попытка обфускации
+
+        if mixed_script_words > 0:
+            obfuscation_score += min(mixed_script_words * 0.25, 0.5)
+
+        # Пробелы между буквами (з а р а б о т о к)
+        spaced_letters = len(re.findall(r'(?<!\S)[а-яёa-z]\s+[а-яёa-z]\s+[а-яёa-z](?!\S)', original_lower))
+        if spaced_letters > 0:
+            obfuscation_score += 0.4
+
+        # Подозрительные Unicode категории (гомоглифы)
+        suspicious_unicode = 0
+        for char in text:
+            cat = unicodedata.category(char)
+            # Буквы из необычных скриптов (Greek, Coptic, etc.)
+            if cat == 'Lo' or (cat == 'Ll' and ord(char) > 0x024F):
+                suspicious_unicode += 1
+        if suspicious_unicode > 2:
+            obfuscation_score += min(suspicious_unicode * 0.15, 0.4)
+
+        features['obfuscation_score'] = min(obfuscation_score, 1.0)
+
+        # 2. CODE MIXING: Смешивание русского и английского
+        code_mix_score = 0.0
+
+        # Английские слова в русском контексте (спам-маркеры)
+        english_spam_words = [
+            'work', 'money', 'job', 'earn', 'income', 'cash', 'pay', 'salary',
+            'worker', 'driver', 'manager', 'crypto', 'bitcoin', 'invest',
+            'easy', 'fast', 'quick', 'free', 'bonus', 'profit', 'trading',
+            'passive', 'remote', 'online', 'telegram', 'whatsapp', 'viber',
+            'casino', 'bet', 'win', 'prize', 'lucky', 'vip', 'premium',
+        ]
+        for eng_word in english_spam_words:
+            if re.search(rf'\b{eng_word}\b', original_lower):
+                code_mix_score += 0.25
+
+        # Проверяем соотношение кириллицы и латиницы в тексте
+        total_cyrillic = len(re.findall(r'[а-яёА-ЯЁ]', text))
+        total_latin = len(re.findall(r'[a-zA-Z]', text))
+
+        # Если есть оба алфавита и латиницы много (>20% от кириллицы)
+        if total_cyrillic > 10 and total_latin > 0:
+            latin_ratio = total_latin / total_cyrillic
+            if 0.1 < latin_ratio < 0.5:  # Подозрительное смешивание
+                code_mix_score += 0.2
+            elif latin_ratio >= 0.5:  # Сильное смешивание
+                code_mix_score += 0.35
+
+        # Латинские буквы, визуально похожие на кириллицу (a, e, o, p, c, x, y)
+        # в окружении кириллицы - явная попытка обхода
+        lookalike_pattern = r'[а-яёА-ЯЁ][aeopcxyAEOPCXY][а-яёА-ЯЁ]'
+        lookalikes = len(re.findall(lookalike_pattern, text))
+        if lookalikes > 0:
+            code_mix_score += min(lookalikes * 0.3, 0.5)
+
+        features['code_mixing'] = min(code_mix_score, 1.0)
+
+        # 3. FUZZY KEYWORD: Нечёткое совпадение с ключевыми словами
+        # Используем простое сравнение подстрок для поиска опечаток
+        fuzzy_score = 0.0
+        critical_keywords = [
+            'заработок', 'заработай', 'работа', 'подработка', 'доход',
+            'оплата', 'деньги', 'рублей', 'тысяч', 'водитель', 'курьер'
+        ]
+        for word in normalized.split():
+            if len(word) >= 5:  # Проверяем только достаточно длинные слова
+                for kw in critical_keywords:
+                    # Проверяем совпадение 70%+ символов
+                    if len(word) >= len(kw) - 2 and len(word) <= len(kw) + 2:
+                        matches = sum(1 for a, b in zip(word, kw) if a == b)
+                        similarity = matches / max(len(word), len(kw))
+                        if similarity >= 0.7 and similarity < 1.0:  # Похоже, но не точно
+                            fuzzy_score += 0.3
+                            break
+        features['fuzzy_keyword'] = min(fuzzy_score, 1.0)
+
+        # 4. SUSPICIOUS STRUCTURE: Подозрительная структура
+        structure_score = 0.0
+
+        # Очень короткое сообщение с числами
+        if len(text) < 100 and has_money:
+            structure_score += 0.3
+
+        # Много строк, каждая короткая (типичный спам-формат)
+        if is_multiline_short:
+            structure_score += 0.2
+
+        # Заканчивается призывом к действию
+        last_words = normalized.split()[-3:] if normalized else []
+        cta_endings = ['пишите', 'звоните', 'откликнитесь', 'пиши', 'звони']
+        if any(w in last_words for w in cta_endings):
+            structure_score += 0.3
+
+        features['suspicious_structure'] = min(structure_score, 1.0)
+
+        # 5. REPEATED NEAR SPAM: Проверяем историю пользователя
+        # (будет использоваться вместе с behavior_analyzer)
+        features['repeated_near_spam'] = min(user_profile.spam_score * 1.5, 1.0)
+
         return features
 
-    def classify(self, features: Dict[str, float]) -> Tuple[bool, float, List[str]]:
-        """Классифицировать сообщение"""
+    def get_dynamic_threshold(self, is_newbie: bool, is_night: bool,
+                               is_verified: bool) -> float:
+        """Получить динамический порог на основе контекста"""
+        if is_verified and not is_newbie:
+            threshold = self.verified_threshold
+        elif is_newbie:
+            threshold = self.newbie_threshold
+        elif is_night:
+            threshold = self.night_threshold
+        else:
+            threshold = self.base_threshold
+
+        return threshold
+
+    def classify(self, features: Dict[str, float],
+                 is_newbie: bool = False, is_night: bool = False,
+                 is_verified: bool = False) -> Tuple[bool, float, List[str]]:
+        """Классифицировать сообщение с динамическим порогом"""
         score = 0.0
         triggered = []
 
@@ -771,10 +1262,13 @@ class MLSpamClassifier:
             if value > 0 and feature in self.weights:
                 contribution = value * self.weights[feature]
                 score += contribution
-                if contribution > 0.1:
+                if contribution > 0.08:  # Снижен порог для triggered
                     triggered.append(feature)
 
-        is_spam = score >= self.threshold
+        # Динамический порог
+        threshold = self.get_dynamic_threshold(is_newbie, is_night, is_verified)
+        is_spam = score >= threshold
+
         return is_spam, min(score, 1.0), triggered
 
 
@@ -876,21 +1370,224 @@ stats = {
 
 # ============== ФУНКЦИИ ==============
 
+def has_rlo_attack(text: str) -> bool:
+    """Проверить наличие RLO/Bidirectional атаки в тексте"""
+    # Опасные bidirectional символы, которые могут скрывать текст
+    dangerous_bidi = {
+        '\u202a',  # Left-to-Right Embedding (LRE)
+        '\u202b',  # Right-to-Left Embedding (RLE)
+        '\u202c',  # Pop Directional Formatting (PDF)
+        '\u202d',  # Left-to-Right Override (LRO)
+        '\u202e',  # Right-to-Left Override (RLO) - самый опасный!
+        '\u2066',  # Left-to-Right Isolate (LRI)
+        '\u2067',  # Right-to-Left Isolate (RLI)
+        '\u2068',  # First Strong Isolate (FSI)
+        '\u2069',  # Pop Directional Isolate (PDI)
+    }
+    return any(char in text for char in dangerous_bidi)
+
+
 def normalize_text(text: str) -> str:
     """Нормализация текста для поиска спама"""
     text = text.lower()
 
+    # === ЭТАП 0: Удаление RLO/Bidirectional символов ===
+    # Эти символы могут скрывать/переворачивать текст
+    bidi_chars = '\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069'
+    for char in bidi_chars:
+        text = text.replace(char, '')
+
+    # === ЭТАП 1: Цифры и символы → буквы (спамеры используют для обхода) ===
+    digit_symbol_subs = {
+        '0': 'о',  # 0 → о
+        '1': 'и',  # 1 → и (или l)
+        '3': 'з',  # 3 → з
+        '4': 'а',  # 4 → а
+        '5': 'с',  # 5 → с (или s)
+        '7': 'т',  # 7 → т
+        '8': 'в',  # 8 → в
+        '9': 'д',  # 9 → д (похоже)
+        '@': 'а',  # @ → а
+        '$': 'с',  # $ → с
+        '!': 'и',  # ! → и (в словах типа пиш!те)
+        '#': 'н',  # # → н
+        '€': 'е',  # € → е
+        '₽': 'р',  # ₽ → р (но это валюта, оставим в паттернах)
+    }
+    for sym, cyr in digit_symbol_subs.items():
+        text = text.replace(sym, cyr)
+
+    # === ЭТАП 2: Базовые латинские → кириллица ===
     replacements = {
+        # Визуально похожие
         'a': 'а', 'e': 'е', 'o': 'о', 'p': 'р', 'c': 'с',
         'x': 'х', 'y': 'у', 'k': 'к', 'h': 'н', 'm': 'м',
-        'b': 'в', 't': 'т', 'i': 'и', 'n': 'н',
+        'b': 'в', 't': 'т', 'i': 'и',
+        # Фонетически похожие (спамеры используют)
+        'n': 'п',  # nишите → пишите
+        'd': 'д',  # dень → день
+        'u': 'у',  # дополнительно для y/u
+        'r': 'р',  # rубль → рубль (фонетически)
+        's': 'с',  # sрочно → срочно
+        'g': 'г',  # gород → город
+        'l': 'л',  # lюди → люди
+        'v': 'в',  # vодитель → водитель
+        'z': 'з',  # zвоните → звоните
+        'w': 'ш',  # wкола → школа (редко, но бывает)
+        'f': 'ф',  # fото → фото
+        'j': 'й',  # jога → йога
+        'q': 'к',  # редко
     }
     for lat, cyr in replacements.items():
         text = text.replace(lat, cyr)
 
-    zero_width = '\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff'
+    # Гомоглифы (Unicode-символы, похожие на кириллицу/латиницу)
+    # Спамеры используют их для обхода фильтров
+    homoglyphs = {
+        # А/а варианты
+        'ɑ': 'а', 'α': 'а', 'а': 'а', 'ạ': 'а', 'ả': 'а', 'ã': 'а',
+        'ā': 'а', 'ă': 'а', 'ặ': 'а', 'ầ': 'а', 'ấ': 'а', 'ẫ': 'а',
+        'ậ': 'а', 'ä': 'а', 'å': 'а', 'ȧ': 'а', 'ǎ': 'а', 'ȁ': 'а',
+        # О/о варианты
+        'ȯ': 'о', 'ο': 'о', 'о': 'о', 'ọ': 'о', 'ỏ': 'о', 'õ': 'о',
+        'ō': 'о', 'ŏ': 'о', 'ö': 'о', 'ő': 'о', 'ô': 'о', 'ồ': 'о',
+        'ố': 'о', 'ỗ': 'о', 'ộ': 'о', 'ơ': 'о', 'ờ': 'о', 'ớ': 'о',
+        'ở': 'о', 'ỡ': 'о', 'ợ': 'о', 'ǒ': 'о', 'ȍ': 'о', '๐': 'о',
+        # Е/е варианты
+        'ε': 'е', 'е': 'е', 'ẹ': 'е', 'ẻ': 'е', 'ẽ': 'е', 'ē': 'е',
+        'ĕ': 'е', 'ė': 'е', 'ë': 'е', 'ě': 'е', 'ȅ': 'е', 'ȩ': 'е',
+        'ệ': 'е', 'ề': 'е', 'ế': 'е', 'ể': 'е', 'ễ': 'е', 'ə': 'е',
+        # И/и варианты
+        'і': 'и', 'ι': 'и', 'ї': 'и', 'ị': 'и', 'ỉ': 'и', 'ĩ': 'и',
+        'ī': 'и', 'ĭ': 'и', 'ï': 'и', 'î': 'и', 'ǐ': 'и', 'ȉ': 'и',
+        # У/у варианты
+        'ü': 'у', 'ű': 'у', 'ù': 'у', 'ú': 'у', 'û': 'у', 'ũ': 'у',
+        'ū': 'у', 'ŭ': 'у', 'ụ': 'у', 'ủ': 'у', 'ư': 'у', 'ừ': 'у',
+        'ứ': 'у', 'ử': 'у', 'ữ': 'у', 'ự': 'у', 'ǔ': 'у', 'ȕ': 'у',
+        # С/с варианты
+        'ϲ': 'с', 'ҫ': 'с', 'ç': 'с', 'ć': 'с', 'ĉ': 'с', 'ċ': 'с', 'č': 'с',
+        # Р/р варианты
+        'ρ': 'р', 'р': 'р', 'ṕ': 'р', 'ṗ': 'р',
+        # Н/н варианты
+        'һ': 'н', 'ң': 'н', 'ℏ': 'н',
+        # Т/т варианты
+        'τ': 'т', 'ţ': 'т', 'ť': 'т', 'ṫ': 'т', 'ṭ': 'т',
+        # В/в варианты
+        'ʙ': 'в', 'ḃ': 'в', 'ḅ': 'в',
+        # М/м варианты
+        'м': 'м', 'ṁ': 'м', 'ṃ': 'м',
+        # Другие
+        'ḳ': 'к', 'ķ': 'к', 'ǩ': 'к',  # К
+        'ẋ': 'х', 'ẍ': 'х',  # Х
+        'ń': 'н', 'ņ': 'н', 'ň': 'н', 'ṅ': 'н', 'ṇ': 'н', 'ṉ': 'н',  # Н
+        'ṡ': 'с', 'ṣ': 'с', 'ś': 'с', 'ŝ': 'с', 'š': 'с',  # С
+        'ṙ': 'р', 'ṛ': 'р', 'ŕ': 'р', 'ř': 'р',  # Р
+        # Ы варианты
+        'ы': 'ы', 'ỵ': 'ы', 'ỷ': 'ы', 'ỹ': 'ы',
+        # Б варианты (похожие на 6)
+        '6': 'б',
+        # Ь/ъ (мягкий/твёрдый знак через похожие)
+        'ƅ': 'ь',
+        # Л варианты
+        'ḷ': 'л', 'ḹ': 'л', 'ļ': 'л', 'ľ': 'л',
+        # Д варианты
+        'ḋ': 'д', 'ḍ': 'д', 'ḏ': 'д', 'đ': 'д', 'ď': 'д',
+        # Г варианты
+        'ġ': 'г', 'ģ': 'г', 'ǧ': 'г', 'ǵ': 'г',
+        # Ж варианты (через zh)
+        'ʒ': 'ж', 'ž': 'ж', 'ż': 'ж',
+        # З варианты
+        'ẑ': 'з', 'ẓ': 'з', 'ź': 'з',
+    }
+    for homo, cyr in homoglyphs.items():
+        text = text.replace(homo, cyr)
+
+    # === ЭТАП 4: Удаление zero-width и невидимых символов ===
+    zero_width = (
+        '\u200b'  # Zero Width Space
+        '\u200c'  # Zero Width Non-Joiner
+        '\u200d'  # Zero Width Joiner
+        '\u200e'  # Left-to-Right Mark
+        '\u200f'  # Right-to-Left Mark
+        '\u2060'  # Word Joiner
+        '\u2061'  # Function Application
+        '\u2062'  # Invisible Times
+        '\u2063'  # Invisible Separator
+        '\u2064'  # Invisible Plus
+        '\u00ad'  # Soft Hyphen
+        '\ufeff'  # Zero Width No-Break Space (BOM)
+        '\u034f'  # Combining Grapheme Joiner
+        '\u061c'  # Arabic Letter Mark
+        '\u115f'  # Hangul Choseong Filler
+        '\u1160'  # Hangul Jungseong Filler
+        '\u17b4'  # Khmer Vowel Inherent Aq
+        '\u17b5'  # Khmer Vowel Inherent Aa
+        '\u180e'  # Mongolian Vowel Separator
+        '\u2800'  # Braille Pattern Blank
+        '\u3164'  # Hangul Filler
+        '\uffa0'  # Halfwidth Hangul Filler
+    )
     for char in zero_width:
         text = text.replace(char, '')
+
+    # === ЭТАП 5: Удаление combining marks (диакритических знаков) ===
+    # Спамеры добавляют их для обхода: з̧а̊р̀а̧б̱о̫т̰о̷к
+    text = ''.join(c for c in text if unicodedata.category(c) != 'Mn')
+
+    # === ЭТАП 6: Удаление пробелов между одиночными буквами ===
+    # "з а р а б о т о к" → "заработок"
+    # Паттерн: буква + пробел + буква + пробел... (минимум 3 буквы через пробелы)
+    def collapse_spaced_letters(t):
+        # Ищем последовательности: буква пробел буква пробел буква...
+        pattern = r'(?<!\S)([а-яёa-z])\s+(?=[а-яёa-z]\s*[а-яёa-z])'
+        # Убираем пробелы между одиночными буквами
+        result = re.sub(r'\b([а-яёa-z])\s+([а-яёa-z])\s+([а-яёa-z])', r'\1\2\3', t)
+        # Повторяем несколько раз для длинных последовательностей
+        for _ in range(5):
+            new_result = re.sub(r'\b([а-яёa-z])\s+([а-яёa-z])\b', r'\1\2', result)
+            if new_result == result:
+                break
+            result = new_result
+        return result
+
+    text = collapse_spaced_letters(text)
+
+    # === ЭТАП 7: Склеивание разбитых спам-слов ===
+    # Спамеры разбивают слова пробелами: "за работок" → "заработок"
+    split_word_fixes = [
+        # Заработок и производные
+        (r'\bза\s+работ', 'заработ'),
+        (r'\bза\s+рабат', 'зарабат'),
+        (r'\bза\s+рплат', 'зарплат'),
+        (r'\bза\s+рабо', 'зарабо'),
+        # Подработка
+        (r'\bпод\s+работ', 'подработ'),
+        (r'\bпод\s+рабо', 'подрабо'),
+        # Доход
+        (r'\bдо\s+ход', 'доход'),
+        # Оплата
+        (r'\bо\s+плат', 'оплат'),
+        (r'\bоп\s+лат', 'оплат'),
+        # Работа
+        (r'\bра\s+бот', 'работ'),
+        (r'\bраб\s+от', 'работ'),
+        # Деньги
+        (r'\bде\s+ньг', 'деньг'),
+        (r'\bден\s+ьг', 'деньг'),
+        # Криптa
+        (r'\bкри\s+пт', 'крипт'),
+        (r'\bкрип\s+т', 'крипт'),
+        # Инвестиции
+        (r'\bин\s+вест', 'инвест'),
+        # Казино
+        (r'\bка\s+зин', 'казин'),
+        # Эскорт
+        (r'\bэс\s+корт', 'эскорт'),
+        # Интим
+        (r'\bин\s+тим', 'интим'),
+    ]
+    for pattern, replacement in split_word_fixes:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
     text = re.sub(r'[^\w\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text)
@@ -953,6 +1650,9 @@ async def auto_ban_user(user_id: int, chat_id: int, reason: str):
         storage.add_banned(user_id)
         stats["users_banned"] += 1
 
+        # Аудит лог
+        audit_logger.log_user_banned(user_id, chat_id, reason)
+
         await notify_admins(
             f"🚫 <b>Авто-бан</b>\n"
             f"Пользователь: <code>{user_id}</code>\n"
@@ -968,7 +1668,7 @@ def get_verify_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Клавиатура для верификации"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text="🎵 Я слушаю БИМ радио и принимаю правила!",
+            text="📻 Хочу быть люБИМцем эфира!",
             callback_data=f"verify_{user_id}"
         )]
     ])
@@ -999,21 +1699,24 @@ async def process_spam_message(message: Message, reason: str, confidence: float)
     chat_id = message.chat.id
     user_name = message.from_user.full_name or message.from_user.username
 
-    # Тестер - показываем что сработало, но НЕ удаляем и НЕ баним
-    if user_id in TESTER_IDS:
+    # Тестер или Админ - НЕ удаляем, только показываем что сработало
+    if user_id in TESTER_IDS or user_id in ADMIN_IDS:
+        role = "ADMIN" if user_id in ADMIN_IDS else "TESTER"
+        role_label = "админ" if user_id in ADMIN_IDS else "тестер"
+
+        # НЕ удаляем сообщение — просто информируем
         test_msg = await message.reply(
-            f"🧪 <b>ТЕСТ-РЕЖИМ</b>\n\n"
-            f"Обнаружен спам: <i>{reason}</i>\n"
-            f"Уверенность: {confidence:.0%}\n\n"
-            f"<i>Сообщение НЕ удалено (вы тестер)</i>",
+            f"🧪 <b>ТЕСТ</b>: Это бы удалилось\n"
+            f"📊 Score: {confidence:.0%} | {reason}\n"
+            f"<i>(вы {role_label}, сообщение сохранено)</i>",
             parse_mode="HTML"
         )
-        await asyncio.sleep(10)
+        await asyncio.sleep(15)
         try:
             await test_msg.delete()
         except:
             pass
-        logger.info(f"[TESTER] Spam detected from {user_name} ({user_id}): {reason} [{confidence:.0%}]")
+        logger.info(f"[{role}] Spam DETECTED (not deleted) from {user_name} ({user_id}): {reason} [{confidence:.0%}]")
         return
 
     try:
@@ -1025,17 +1728,23 @@ async def process_spam_message(message: Message, reason: str, confidence: float)
         # Добавляем предупреждение
         warnings = storage.add_warning(user_id)
 
+        # Аудит лог
+        text = message.text or message.caption or ""
+        audit_logger.log_spam_detected(
+            user_id, chat_id, text, confidence, reason.split(', ')
+        )
+
         logger.info(f"Spam deleted from {user_name} ({user_id}): {reason} [{confidence:.0%}], warning {warnings}/{MAX_WARNINGS}")
 
         # Проверяем на авто-бан
         if warnings >= MAX_WARNINGS:
             await auto_ban_user(user_id, chat_id, f"Превышен лимит предупреждений ({MAX_WARNINGS})")
-            warn_text = f"🚫 <b>{user_name}</b> забанен.\nПричина: {MAX_WARNINGS} предупреждений"
+            warn_text = f"📻🚫 <b>{user_name}</b> отключён от эфира.\n{MAX_WARNINGS} помех — это перебор!"
         else:
             warn_text = (
-                f"⚠️ Сообщение удалено.\n"
+                f"📻 Помехи в эфире! Сообщение удалено.\n"
                 f"<i>Причина: {reason}</i>\n"
-                f"Предупреждение: {warnings}/{MAX_WARNINGS}"
+                f"⚠️ Предупреждение: {warnings}/{MAX_WARNINGS}"
             )
 
         warn_msg = await message.answer(warn_text, parse_mode="HTML")
@@ -1089,6 +1798,13 @@ async def on_user_join(event: ChatMemberUpdated):
     is_raid = raid_detector.record_join(chat_id)
     if is_raid:
         stats["raids_detected"] += 1
+        # Аудит лог
+        audit_logger.log_security_event(
+            "RAID_DETECTED",
+            user_id=user.id,
+            chat_id=chat_id,
+            details=f"joins_per_min={raid_detector.get_join_rate(chat_id)}"
+        )
         await notify_admins(
             f"🚨 <b>РЕЙД ОБНАРУЖЕН!</b>\n\n"
             f"Чат: <code>{chat_id}</code>\n"
@@ -1224,10 +1940,13 @@ async def on_verify_click(callback: CallbackQuery):
         verified_users.add(user_id)
         stats["users_verified"] += 1
 
+        # Аудит лог
+        audit_logger.log_user_verified(user_id, callback.message.chat.id)
+
         await callback.message.edit_text(
-            f"🎉 <b>{callback.from_user.full_name}</b> теперь с нами!\n\n"
-            f"🎵 Добро пожаловать в семью БИМ радио!\n"
-            f"Слушай 102.8 FM и общайся с нами 📻",
+            f"🎉 <b>{callback.from_user.full_name}</b> теперь люБИМец эфира!\n\n"
+            f"📻 Добро пожаловать на волну 102.8 FM!\n"
+            f"Общайся, слушай, будь на связи 🎵",
             parse_mode="HTML"
         )
 
@@ -1247,8 +1966,7 @@ async def on_verify_click(callback: CallbackQuery):
 @router.message(F.chat.type.in_({"group", "supergroup"}), F.photo)
 async def on_photo_message(message: Message):
     """Обработка фото с OCR"""
-    if message.from_user.id in ADMIN_IDS:
-        return
+    # Админы и тестеры проверяются, но без последствий (в process_spam_message)
 
     if storage.is_whitelisted(message.from_user.id):
         return
@@ -1284,7 +2002,10 @@ async def on_photo_message(message: Message):
                 features = ml_classifier.extract_features(
                     ocr_text, user_profile, is_newbie, is_night, text_has_links, is_cas
                 )
-                is_spam, confidence, triggered = ml_classifier.classify(features)
+                is_verified = message.from_user.id in verified_users
+                is_spam, confidence, triggered = ml_classifier.classify(
+                    features, is_newbie=is_newbie, is_night=is_night, is_verified=is_verified
+                )
 
                 if is_spam:
                     stats["ocr_detections"] += 1
@@ -1301,8 +2022,7 @@ async def on_photo_message(message: Message):
 @router.message(F.chat.type.in_({"group", "supergroup"}), F.forward_from | F.forward_from_chat)
 async def on_forward_message(message: Message):
     """Обработка пересланных сообщений"""
-    if message.from_user.id in ADMIN_IDS:
-        return
+    # Админы и тестеры проверяются, но без последствий (в process_spam_message)
 
     if storage.is_whitelisted(message.from_user.id):
         return
@@ -1313,7 +2033,7 @@ async def on_forward_message(message: Message):
             await message.delete()
             stats["newbie_restricted"] += 1
             warn_msg = await message.answer(
-                f"⚠️ Новые участники не могут пересылать сообщения первые {NEWBIE_HOURS} часов.",
+                f"📻 Репосты — только для люБИМцев со стажем! Подожди {NEWBIE_HOURS}ч 🎵",
                 parse_mode="HTML"
             )
             await asyncio.sleep(5)
@@ -1331,9 +2051,7 @@ async def on_forward_message(message: Message):
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 async def on_group_message(message: Message):
     """Проверка сообщений на спам"""
-    # Пропускаем админов
-    if message.from_user.id in ADMIN_IDS:
-        return
+    # Админы и тестеры проверяются, но без последствий (в process_spam_message)
 
     # Пропускаем whitelist
     if storage.is_whitelisted(message.from_user.id):
@@ -1352,6 +2070,8 @@ async def check_text_for_spam(message: Message, text: str):
     user_id = message.from_user.id
     chat_id = message.chat.id
     is_tester = user_id in TESTER_IDS
+    is_admin = user_id in ADMIN_IDS
+    is_privileged = is_tester or is_admin  # Тестеры и админы - привилегированные
 
     # Записываем активность
     behavior_analyzer.record_message(user_id)
@@ -1361,15 +2081,15 @@ async def check_text_for_spam(message: Message, text: str):
     is_night = is_night_mode()
     text_has_links = has_links(text)
 
-    # Проверка cooldown для новичков (тестеры видят предупреждение, но не блокируются)
-    if is_newbie and not is_tester:
+    # Проверка cooldown для новичков (тестеры/админы видят предупреждение, но не блокируются)
+    if is_newbie and not is_privileged:
         can_send, seconds_left = behavior_analyzer.check_newbie_cooldown(user_id)
         if not can_send:
             try:
                 await message.delete()
                 stats["newbie_restricted"] += 1
                 warn_msg = await message.answer(
-                    f"⏳ Подождите {seconds_left} сек. (slow mode для новых участников)",
+                    f"📻 Настройся на волну! Подожди {seconds_left} сек. 🎵",
                 )
                 await asyncio.sleep(3)
                 await warn_msg.delete()
@@ -1377,12 +2097,13 @@ async def check_text_for_spam(message: Message, text: str):
                 pass
             return
         behavior_analyzer.record_newbie_message(user_id)
-    elif is_newbie and is_tester:
-        # Тестер-новичок - показываем что сработало бы
+    elif is_newbie and is_privileged:
+        # Тестер/админ-новичок - показываем что сработало бы
         can_send, seconds_left = behavior_analyzer.check_newbie_cooldown(user_id)
         if not can_send:
+            role = "админ" if is_admin else "тестер"
             warn_msg = await message.reply(
-                f"🧪 <b>ТЕСТ:</b> Slow mode ({seconds_left} сек.) — сообщение НЕ удалено",
+                f"🧪 <b>ТЕСТ:</b> Slow mode ({seconds_left} сек.) — сообщение НЕ удалено (вы {role})",
                 parse_mode="HTML"
             )
             await asyncio.sleep(5)
@@ -1394,9 +2115,10 @@ async def check_text_for_spam(message: Message, text: str):
 
     # Ограничение ссылок для новичков
     if is_newbie and text_has_links:
-        if is_tester:
+        if is_privileged:
+            role = "админ" if is_admin else "тестер"
             warn_msg = await message.reply(
-                f"🧪 <b>ТЕСТ:</b> Ссылки для новичков запрещены — сообщение НЕ удалено",
+                f"🧪 <b>ТЕСТ:</b> Ссылки для новичков запрещены — сообщение НЕ удалено (вы {role})",
                 parse_mode="HTML"
             )
             await asyncio.sleep(5)
@@ -1409,7 +2131,7 @@ async def check_text_for_spam(message: Message, text: str):
                 await message.delete()
                 stats["newbie_restricted"] += 1
                 warn_msg = await message.answer(
-                    f"🔗 Новые участники не могут отправлять ссылки первые {NEWBIE_HOURS} часов.",
+                    f"📻 Ссылки в эфир — только для люБИМцев со стажем! Подожди {NEWBIE_HOURS}ч 🎵",
                 )
                 await asyncio.sleep(5)
                 await warn_msg.delete()
@@ -1450,7 +2172,20 @@ async def check_text_for_spam(message: Message, text: str):
     features = ml_classifier.extract_features(
         text, user_profile, is_newbie, is_night, text_has_links, user_profile.is_cas_banned
     )
-    is_spam, confidence, triggered = ml_classifier.classify(features)
+    is_verified = user_id in verified_users
+    is_spam, confidence, triggered = ml_classifier.classify(
+        features, is_newbie=is_newbie, is_night=is_night, is_verified=is_verified
+    )
+
+    # DEBUG: Логируем для админов/тестеров
+    if is_privileged:
+        normalized = normalize_text(text)
+        threshold = ml_classifier.get_dynamic_threshold(is_newbie, is_night, is_verified)
+        logger.info(f"[DEBUG] Original: {repr(text)}")
+        logger.info(f"[DEBUG] Normalized: {repr(normalized)}")
+        logger.info(f"[DEBUG] Score: {confidence:.2f}, Threshold: {threshold:.2f}, Spam: {is_spam}, Triggered: {triggered}")
+        top_features = {k: v for k, v in features.items() if v > 0}
+        logger.info(f"[DEBUG] Active features: {top_features}")
 
     if is_spam:
         reason = ', '.join(triggered[:3]) if triggered else "подозрительное сообщение"
@@ -1462,7 +2197,7 @@ async def check_text_for_spam(message: Message, text: str):
 @router.message(Command("spam_stats"))
 async def cmd_stats(message: Message):
     """Статистика бота"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     uptime = datetime.now() - stats["start_time"]
@@ -1500,7 +2235,7 @@ async def cmd_stats(message: Message):
 @router.message(Command("spam_add"))
 async def cmd_add_keyword(message: Message):
     """Добавить ключевое слово"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     args = message.text.split(maxsplit=1)
@@ -1519,7 +2254,7 @@ async def cmd_add_keyword(message: Message):
 @router.message(Command("spam_whitelist"))
 async def cmd_whitelist(message: Message):
     """Управление whitelist"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     args = message.text.split()
@@ -1563,7 +2298,7 @@ async def cmd_whitelist(message: Message):
 @router.message(Command("spam_check"))
 async def cmd_check_user(message: Message):
     """Полная проверка пользователя — все данные в одном месте"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     # Получаем user_id из реплая или аргумента
@@ -1646,7 +2381,7 @@ async def cmd_check_user(message: Message):
 @router.message(Command("spam_unban"))
 async def cmd_unban(message: Message):
     """Разбанить пользователя"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     args = message.text.split()
@@ -1675,7 +2410,7 @@ async def cmd_unban(message: Message):
 @router.message(Command("spam_warn"))
 async def cmd_check_warnings(message: Message):
     """Проверить предупреждения пользователя"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     args = message.text.split()
@@ -1697,7 +2432,7 @@ async def cmd_check_warnings(message: Message):
 @router.message(Command("spam_test"))
 async def cmd_test_spam(message: Message):
     """Проверить текст на спам"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     args = message.text.split(maxsplit=1)
@@ -1711,13 +2446,18 @@ async def cmd_test_spam(message: Message):
     fake_profile = UserProfile(user_id=0)
 
     # Извлекаем признаки
+    is_night = is_night_mode()
     features = ml_classifier.extract_features(
         test_text, fake_profile,
-        is_newbie=True, is_night=is_night_mode(),
+        is_newbie=True, is_night=is_night,
         has_link=has_links(test_text), is_cas_banned=False
     )
 
-    is_spam_result, confidence, triggered = ml_classifier.classify(features)
+    # Тестируем как новичка (строгий режим)
+    is_spam_result, confidence, triggered = ml_classifier.classify(
+        features, is_newbie=True, is_night=is_night, is_verified=False
+    )
+    threshold = ml_classifier.get_dynamic_threshold(is_newbie=True, is_night=is_night, is_verified=False)
 
     # Проверка на мат
     has_profanity = check_profanity(test_text)
@@ -1728,7 +2468,7 @@ async def cmd_test_spam(message: Message):
     report = (
         f"🔍 <b>Результат проверки:</b>\n\n"
         f"📝 Текст: <code>{test_text[:100]}{'...' if len(test_text) > 100 else ''}</code>\n\n"
-        f"{result} (уверенность: {confidence:.0%})\n\n"
+        f"{result} (score: {confidence:.0%}, порог: {threshold:.0%})\n\n"
     )
 
     if triggered:
@@ -1752,7 +2492,7 @@ async def cmd_test_spam(message: Message):
 @router.message(Command("spam_lockdown"))
 async def cmd_lockdown(message: Message):
     """Управление режимом блокировки (антирейд)"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     args = message.text.split()
@@ -1788,7 +2528,7 @@ async def cmd_lockdown(message: Message):
 @router.message(Command("spam_help"))
 async def cmd_help(message: Message):
     """Помощь по командам"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in TESTER_IDS:
         return
 
     await message.answer(
@@ -1796,15 +2536,16 @@ async def cmd_help(message: Message):
         "<b>📊 Статистика:</b>\n"
         "/spam_stats — статистика бота\n\n"
         "<b>🔍 Проверка:</b>\n"
-        "/spam_test <текст> — проверить текст на спам\n"
-        "/spam_check <id> — полная проверка юзера\n\n"
+        "/spam_test [текст] — проверить текст на спам\n"
+        "/spam_check [id] — полная проверка юзера\n\n"
         "<b>📝 Управление:</b>\n"
-        "/spam_add <слово> — добавить стоп-слово\n"
+        "/spam_add [слово] — добавить стоп-слово\n"
         "/spam_whitelist — управление whitelist\n"
-        "/spam_warn <id> — проверить предупреждения\n"
-        "/spam_unban <id> — разбанить пользователя\n\n"
+        "/spam_warn [id] — проверить предупреждения\n"
+        "/spam_unban [id] — разбанить пользователя\n\n"
         "<b>🚨 Антирейд:</b>\n"
-        "/spam_lockdown — управление блокировкой\n\n"
+        "/spam_lockdown — управление блокировкой\n"
+        "/spam_reset — сбросить свой профиль (после тестов)\n\n"
         "<b>🛡 Возможности:</b>\n"
         "• Верификация с правилами БИМ радио\n"
         "• CAS (Combot Anti-Spam)\n"
@@ -1818,6 +2559,37 @@ async def cmd_help(message: Message):
     )
 
 
+@router.message(Command("spam_reset"))
+async def cmd_reset_profile(message: Message):
+    """Сбросить свой spam профиль (для тестеров/админов)"""
+    user_id = message.from_user.id
+
+    if user_id not in ADMIN_IDS and user_id not in TESTER_IDS:
+        return
+
+    # Сбрасываем профиль
+    if user_id in behavior_analyzer.profiles:
+        del behavior_analyzer.profiles[user_id]
+
+    # Сбрасываем предупреждения
+    if user_id in storage.warnings:
+        del storage.warnings[user_id]
+        storage._save()
+
+    # Удаляем из message_times и newbie_messages
+    behavior_analyzer.message_times.pop(user_id, None)
+    behavior_analyzer.newbie_messages.pop(user_id, None)
+
+    await message.answer(
+        "📻 <b>Эфир очищен!</b>\n\n"
+        "• Репутация: чистая\n"
+        "• Предупреждения: 0\n\n"
+        "Снова на чистой волне 102.8 FM 🎵",
+        parse_mode="HTML"
+    )
+    logger.info(f"Profile reset for user {user_id}")
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     """Приветствие в личных сообщениях"""
@@ -1826,24 +2598,23 @@ async def cmd_start(message: Message):
 
     is_admin = message.from_user.id in ADMIN_IDS
 
+    is_tester = message.from_user.id in TESTER_IDS
+
     await message.answer(
-        "🎙 <b>БИМ радио 102.8 FM — Антиспам бот v3.0</b>\n\n"
-        "Привет! Я защищаю чат нашей радиостанции от спама и ботов.\n\n"
+        f"📻 <b>БИМ радио 102.8 FM — Защитник эфира v{BOT_VERSION}</b>\n\n"
+        "Привет, люБИМец! Я охраняю наш чат от спамеров и помех в эфире.\n\n"
         "<b>Мои суперсилы:</b>\n"
         "🎵 Верификация новых слушателей\n"
-        "🛡 CAS (Combot Anti-Spam) проверка\n"
-        "⚠️ Авто-бан после 5 предупреждений\n"
+        "🛡 CAS антиспам проверка\n"
+        "📻 5 помех — отключение от эфира\n"
         "🌙 Ночной режим (23:00-07:00)\n"
-        "📝 Whitelist для доверенных\n"
-        "⏳ Slow mode для новичков\n"
-        "🔗 Защита от спам-ссылок\n"
-        "🤖 ML классификация спама\n"
-        "📷 Распознавание текста на картинках\n"
-        "🤬 Мат-фильтр\n"
+        "⏳ Адаптация для новичков\n"
+        "🤖 Умная ML-фильтрация\n"
+        "📷 Проверка картинок\n"
         "🚨 Антирейд защита\n\n"
-        "📻 <b>Слушай БИМ радио 102.8 FM!</b>\n\n"
-        + ("👑 <b>Вы администратор бота</b>\n"
-           "/spam_help — все команды" if is_admin else ""),
+        "🎵 <b>Слушай 102.8 FM — будь на волне!</b>\n\n"
+        + ("👑 <b>Вы в команде эфира!</b>\n"
+           "/spam_help — все команды" if (is_admin or is_tester) else ""),
         parse_mode="HTML"
     )
 
@@ -1874,7 +2645,23 @@ async def auto_cleanup_task():
                 if now - cached_at > cas_checker.cache_ttl:
                     del cas_checker.cache[user_id]
 
-            logger.info("Auto-cleanup completed")
+            # Очистка user profiles для предотвращения утечки памяти
+            cleaned_profiles = behavior_analyzer.cleanup_old_profiles()
+            if cleaned_profiles > 0:
+                logger.info(f"Cleaned {cleaned_profiles} old user profiles")
+
+            # Ограничение размера verified_users
+            global verified_users
+            if len(verified_users) > MAX_VERIFIED_USERS:
+                # Нельзя определить "старых" пользователей в set, просто обрезаем
+                # В реальности это редко случается
+                excess = len(verified_users) - MAX_VERIFIED_USERS
+                logger.warning(f"verified_users overflow! Removing {excess} entries")
+                # Конвертируем в список, удаляем первые N, конвертируем обратно
+                users_list = list(verified_users)
+                verified_users = set(users_list[excess:])
+
+            logger.info(f"Auto-cleanup completed. Profiles: {len(behavior_analyzer.profiles)}, Verified: {len(verified_users)}")
 
         except Exception as e:
             logger.error(f"Auto-cleanup error: {e}")
@@ -1903,7 +2690,7 @@ async def grant_full_permissions_task():
 
 async def main():
     """Запуск бота"""
-    logger.info("Starting spam filter bot v3.0...")
+    logger.info(f"Starting spam filter bot v{BOT_VERSION}...")
     logger.info(f"OCR available: {OCR_AVAILABLE}")
     logger.info(f"Aiohttp available: {AIOHTTP_AVAILABLE}")
     logger.info(f"Night mode: {NIGHT_START} - {NIGHT_END}")
