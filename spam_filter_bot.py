@@ -261,6 +261,9 @@ SPAM_PATTERNS = [
     r"\d+\s*(?:₽|руб|рублей)\s*(?:в\s*)?(?:час|день|неделю|месяц)",
     r"(?:от|до)\s*\d{3,}\s*(?:в\s*)?(?:час|день|неделю)",
     r"\d{4,}\s*(?:₽|руб|рублей|р\.)",
+    r"(?:от|до)\s*\d{1,3}(?:[ .]\d{3})+\s*(?:₽|руб|рублей|р\.)",
+    r"\d{1,3}(?:[ .]\d{3})+\s*(?:₽|руб|рублей|р\.)",
+    r"(?:доход|заработок)\s*(?:от|до)?\s*\d+",
 
     # Призывы в ЛС
     r"(?:пиш[иу]|напиш[иу])(?:те)?\s*(?:в\s*)?(?:лс|личк|л\.с\.|дм|dm|директ)",
@@ -346,6 +349,38 @@ SPAM_COMBO_WORDS = [
     "недорого", "дешево", "цена", "цены",
     "готов", "готовы", "могу", "можем",
     "выезд", "выезжаем", "приеду", "приедем",
+]
+
+# Промо-контент про заработок/крипту
+CRYPTO_PROMO_KEYWORDS = [
+    "крипта", "криптовалюта", "цифровые валюты", "биткоин", "эфир", "трейдинг",
+    "арбитраж", "p2p", "биржа", "альткоин", "тон", "блокчейн",
+]
+
+CRYPTO_PROMO_ROOTS = [
+    "крипт", "цифров", "валют", "биткоин", "эфир", "трейд", "арбитраж", "бирж",
+]
+
+EARNINGS_PROMO_KEYWORDS = [
+    "заработок", "доход", "доходность", "пассивный доход", "заработать",
+    "зарабатывает", "зарабатывают", "зарабатывать",
+    "без вложений", "без опыта", "в день", "в неделю",
+    "удаленная работа", "работа на дому",
+]
+
+EARNINGS_PROMO_ROOTS = [
+    "заработ", "доход", "прибыл", "пассивн",
+]
+
+PROMO_CONTEXT_KEYWORDS = [
+    "книга", "гайд", "курс", "обучение", "урок", "методичка",
+    "рекомендую", "советую", "полезная", "интересная", "поделился",
+    "поделилась", "рассказал", "рассказала", "совет", "обзор",
+]
+
+CTA_KEYWORDS = [
+    "пиши", "пишите", "напиши", "напишите", "пиши в", "пишите в",
+    "жми", "переходи", "перейди", "смотри", "смотри в",
 ]
 
 # Мат-фильтр (базовые корни)
@@ -658,6 +693,9 @@ class MLSpamClassifier:
             'adult_emojis': 0.45,
             'adult_emoji_combo': 0.60,
             'night_adult': 0.35,
+            'crypto_promo': 0.45,
+            'earnings_promo': 0.4,
+            'cta_link': 0.35,
         }
         self.threshold = 0.45
 
@@ -759,6 +797,18 @@ class MLSpamClassifier:
         # Ночь + 18+ контент = очень подозрительно
         has_adult_content = adult_count > 0 or adult_emoji_count >= 2
         features['night_adult'] = 1.0 if (is_night and has_adult_content) else 0.0
+
+        # Промо по крипте/заработку
+        has_crypto = any(kw in normalized for kw in CRYPTO_PROMO_KEYWORDS) or any(
+            root in normalized for root in CRYPTO_PROMO_ROOTS
+        )
+        has_earnings = any(kw in normalized for kw in EARNINGS_PROMO_KEYWORDS) or any(
+            root in normalized for root in EARNINGS_PROMO_ROOTS
+        )
+        has_promo_context = any(kw in normalized for kw in PROMO_CONTEXT_KEYWORDS)
+        features['crypto_promo'] = 1.0 if (has_crypto and has_promo_context) else 0.0
+        features['earnings_promo'] = 1.0 if (has_earnings and (has_promo_context or has_link)) else 0.0
+        features['cta_link'] = 1.0 if (has_link and any(kw in normalized for kw in CTA_KEYWORDS)) else 0.0
 
         return features
 
