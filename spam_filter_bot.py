@@ -1382,29 +1382,30 @@ async def on_forward_message(message: Message):
 @router.message(F.chat.type.in_({"group", "supergroup"}), ~F.text.startswith("/"))
 async def on_group_message(message: Message):
     """Проверка сообщений на спам"""
-    # Пропускаем админов
-    if message.from_user.id in ADMIN_IDS:
-        return
+    # Админы в тестовом режиме - видят что бы произошло
+    is_admin_test = message.from_user.id in ADMIN_IDS
 
-    # Пропускаем whitelist
-    if storage.is_whitelisted(message.from_user.id):
+    # Пропускаем whitelist (кроме админов в тест-режиме)
+    if not is_admin_test and storage.is_whitelisted(message.from_user.id):
         return
 
     text = message.text or message.caption or ""
-    await check_text_for_spam(message, text)
+    await check_text_for_spam(message, text, admin_test=is_admin_test)
 
 
-async def check_text_for_spam(message: Message, text: str):
+async def check_text_for_spam(message: Message, text: str, admin_test: bool = False):
     """Проверить текст на спам"""
     user_id = message.from_user.id
     chat_id = message.chat.id
-    is_tester = user_id in TESTER_IDS
+    is_tester = user_id in TESTER_IDS or admin_test
 
-    # Записываем активность
-    behavior_analyzer.record_message(user_id)
+    # Для админов не записываем активность и не проверяем newbie
+    if not admin_test:
+        # Записываем активность
+        behavior_analyzer.record_message(user_id)
 
     user_profile = behavior_analyzer.get_profile(user_id)
-    is_newbie = behavior_analyzer.is_newbie(user_id)
+    is_newbie = behavior_analyzer.is_newbie(user_id) if not admin_test else False
     is_night = is_night_mode()
     text_has_links = has_links(text)
 
@@ -1466,16 +1467,19 @@ async def check_text_for_spam(message: Message, text: str):
 
     # Проверка на мат
     if check_profanity(text):
-        stats["profanity_blocked"] += 1
-        await process_spam_message(message, "нецензурная лексика", 0.9)
+        if admin_test:
+            await show_admin_test_result(message, "нецензурная лексика", 0.9)
+        else:
+            stats["profanity_blocked"] += 1
+            await process_spam_message(message, "нецензурная лексика", 0.9)
         return
 
     # Ночной режим - строже проверки
-    if is_night:
+    if is_night and not admin_test:
         user_profile.spam_score += 0.1  # Увеличиваем подозрительность ночью
 
-    # CAS проверка (если ещё не проверяли)
-    if not user_profile.is_cas_banned:
+    # CAS проверка (если ещё не проверяли) - пропускаем для админов
+    if not admin_test and not user_profile.is_cas_banned:
         user_profile.is_cas_banned = await cas_checker.check(user_id)
         if user_profile.is_cas_banned:
             stats["cas_blocked"] += 1
@@ -1486,22 +1490,57 @@ async def check_text_for_spam(message: Message, text: str):
                 pass
             return
 
-    # Проверка на дубликаты
-    is_duplicate, dup_reason = similarity_checker.check(text, user_id, chat_id)
-    if is_duplicate:
-        stats["duplicates_blocked"] += 1
-        await process_spam_message(message, dup_reason, 0.85)
-        return
+    # Проверка на дубликаты - пропускаем для админов
+    if not admin_test:
+        is_duplicate, dup_reason = similarity_checker.check(text, user_id, chat_id)
+        if is_duplicate:
+            stats["duplicates_blocked"] += 1
+            await process_spam_message(message, dup_reason, 0.85)
+            return
 
     # ML классификация
     features = ml_classifier.extract_features(
-        text, user_profile, is_newbie, is_night, text_has_links, user_profile.is_cas_banned
+        text, user_profile, is_newbie, is_night, text_has_links, user_profile.is_cas_banned if not admin_test else False
     )
     is_spam, confidence, triggered = ml_classifier.classify(features)
 
     if is_spam:
         reason = ', '.join(triggered[:3]) if triggered else "подозрительное сообщение"
-        await process_spam_message(message, reason, confidence)
+        if admin_test:
+            await show_admin_test_result(message, reason, confidence, triggered, features)
+        else:
+            await process_spam_message(message, reason, confidence)
+
+
+async def show_admin_test_result(message: Message, reason: str, confidence: float,
+                                  triggered: List[str] = None, features: Dict = None):
+    """Показать админу результат проверки (без удаления)"""
+    triggered_str = ", ".join(triggered[:5]) if triggered else reason
+
+    # Формируем детали
+    details = []
+    if features:
+        for feat, val in features.items():
+            if val > 0:
+                details.append(f"• {feat}: {val:.2f}")
+
+    details_str = "\n".join(details[:8]) if details else "—"
+
+    test_msg = await message.reply(
+        f"🧪 <b>ТЕСТ-РЕЖИМ (админ)</b>\n\n"
+        f"⚠️ Это сообщение было бы удалено!\n\n"
+        f"<b>Причина:</b> {triggered_str}\n"
+        f"<b>Уверенность:</b> {confidence:.0%}\n\n"
+        f"<b>Сработавшие фильтры:</b>\n{details_str}",
+        parse_mode="HTML"
+    )
+
+    # Удаляем тестовое сообщение через 10 сек
+    await asyncio.sleep(10)
+    try:
+        await test_msg.delete()
+    except:
+        pass
 
 
 # ============== КОМАНДЫ АДМИНИСТРАТОРА ==============
