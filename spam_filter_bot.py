@@ -1379,7 +1379,7 @@ async def on_forward_message(message: Message):
         await check_text_for_spam(message, text)
 
 
-@router.message(F.chat.type.in_({"group", "supergroup"}))
+@router.message(F.chat.type.in_({"group", "supergroup"}), ~F.text.startswith("/"))
 async def on_group_message(message: Message):
     """Проверка сообщений на спам"""
     # Пропускаем админов
@@ -1388,10 +1388,6 @@ async def on_group_message(message: Message):
 
     # Пропускаем whitelist
     if storage.is_whitelisted(message.from_user.id):
-        return
-
-    # Пропускаем команды
-    if message.text and message.text.startswith("/"):
         return
 
     text = message.text or message.caption or ""
