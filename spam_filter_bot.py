@@ -1699,30 +1699,24 @@ async def process_spam_message(message: Message, reason: str, confidence: float)
     chat_id = message.chat.id
     user_name = message.from_user.full_name or message.from_user.username
 
-    # Тестер или Админ - УДАЛЯЕМ сообщение, но БЕЗ предупреждений и бана
+    # Тестер или Админ - НЕ удаляем, только показываем что сработало
     if user_id in TESTER_IDS or user_id in ADMIN_IDS:
         role = "ADMIN" if user_id in ADMIN_IDS else "TESTER"
         role_label = "админ" if user_id in ADMIN_IDS else "тестер"
 
-        try:
-            await message.delete()
-            stats["spam_deleted"] += 1
-        except Exception as e:
-            logger.warning(f"[{role}] Failed to delete message: {e}")
-
-        test_msg = await message.answer(
-            f"🧪 <b>ТЕСТ-РЕЖИМ</b>\n\n"
-            f"Спам удалён: <i>{reason}</i>\n"
-            f"Уверенность: {confidence:.0%}\n\n"
-            f"<i>Без предупреждения (вы {role_label})</i>",
+        # НЕ удаляем сообщение — просто информируем
+        test_msg = await message.reply(
+            f"🧪 <b>ТЕСТ</b>: Это бы удалилось\n"
+            f"📊 Score: {confidence:.0%} | {reason}\n"
+            f"<i>(вы {role_label}, сообщение сохранено)</i>",
             parse_mode="HTML"
         )
-        await asyncio.sleep(10)
+        await asyncio.sleep(15)
         try:
             await test_msg.delete()
         except:
             pass
-        logger.info(f"[{role}] Spam DELETED from {user_name} ({user_id}): {reason} [{confidence:.0%}]")
+        logger.info(f"[{role}] Spam DETECTED (not deleted) from {user_name} ({user_id}): {reason} [{confidence:.0%}]")
         return
 
     try:
